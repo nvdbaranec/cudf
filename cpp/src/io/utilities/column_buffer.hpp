@@ -26,6 +26,8 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <../tests/utilities/column_utilities.hpp>
+
 #include <rmm/thrust_rmm_allocator.h>
 #include <rmm/device_buffer.hpp>
 
@@ -49,6 +51,8 @@ inline rmm::device_buffer create_data(
   cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource())
 {
+  // printf("create_data : %d, %d\n", (int)type.id(), (int)size);
+
   std::size_t data_size = size_of(type) * size;
 
   rmm::device_buffer data(data_size, stream, mr);
@@ -70,10 +74,14 @@ struct column_buffer {
                 cudaStream_t stream                 = 0,
                 rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource())
   {
-    if (type.id() == type_id::STRING) {
+    switch(type.id()){
+    case type_id::STRING:    
       _strings.resize(size);
-    } else {
+      break;
+
+    default:    
       _data = create_data(type, size, stream, mr);
+      break;
     }
     if (is_nullable) { _null_mask = create_null_mask(size, mask_state::ALL_NULL, stream, mr); }
     _null_count = 0;
@@ -118,11 +126,31 @@ std::unique_ptr<column> make_column(
   cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource())
 {
-  if (type.id() == type_id::STRING) {
+  switch(type.id()){
+  case type_id::STRING:
     return make_strings_column(buffer._strings, stream, mr);
-  } else {
-    return std::make_unique<column>(
+
+  case type_id::LIST:
+    {
+      auto chk = std::make_unique<column>(
+      data_type{INT32}, size, std::move(buffer._data) /*, std::move(buffer._null_mask), buffer._null_count*/);
+
+      //printf("LIST COL : \n");
+      //test::print(*chk);
+
+      return chk;
+    }
+    break;
+
+  default:  
+    { 
+    auto chk = std::make_unique<column>(
       type, size, std::move(buffer._data), std::move(buffer._null_mask), buffer._null_count);
+
+      //printf("OTHER COL : \n");
+      //test::print(*chk);
+      return chk;
+    }
   }
 }
 

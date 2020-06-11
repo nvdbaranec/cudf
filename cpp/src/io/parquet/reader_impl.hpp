@@ -133,6 +133,12 @@ class reader::impl {
                                           hostdevice_vector<gpu::PageInfo> &pages,
                                           cudaStream_t stream);
 
+  void preprocess_nested_columns(hostdevice_vector<gpu::ColumnChunkDesc> &chunks,
+                                      hostdevice_vector<gpu::PageInfo> &pages,
+                                      size_t min_row,
+                                      size_t total_rows,
+                                      cudaStream_t stream);
+
   /**
    * @brief Converts the page data and outputs to columns.
    *
@@ -149,7 +155,7 @@ class reader::impl {
                         size_t min_row,
                         size_t total_rows,
                         const std::vector<int> &chunk_map,
-                        std::vector<column_buffer> &out_buffers,
+                         std::vector<std::vector<column_buffer>>& out_buffers,
                         cudaStream_t stream);
 
  private:

@@ -16,6 +16,8 @@
 
 #include "parquet.h"
 
+#include "printer.hpp"
+
 namespace cudf {
 namespace io {
 namespace parquet {
@@ -43,7 +45,7 @@ const uint8_t CompactProtocolReader::g_list2struct[16] = {0,
  * @param[in] depth Level of struct nesting
  *
  * @return True if the struct type is recognized, false otherwise
- **/
+ */
 bool CompactProtocolReader::skip_struct_field(int t, int depth)
 {
   switch (t) {
@@ -284,11 +286,24 @@ PARQUET_END_STRUCT()
  * @param[in] md File metadata that was previously parsed
  *
  * @return True if schema constructed completely, false otherwise
- **/
+ */
+/*
 bool CompactProtocolReader::InitSchema(FileMetaData *md)
 {
   int final_pos = WalkSchema(md->schema);
   if (final_pos != md->schema.size()) { return false; }
+
+  size_t idx;
+  
+  for(idx=0; idx<md->schema.size(); idx++){
+    PRINTF("Schema[%d] type : %d, converted type : %d, name %s, parent : %d, repetition : %d, rep max : %d \n", (int)idx, 
+              md->schema[idx].type,
+              md->schema[idx].converted_type,
+              md->schema[idx].name.c_str(),
+              md->schema[idx].parent_idx,
+              (int)md->schema[idx].repetition_type,
+              md->schema[idx].max_repetition_level);
+  }
 
   // Map columns to schema
   for (size_t i = 0; i < md->row_groups.size(); i++) {
@@ -316,10 +331,15 @@ bool CompactProtocolReader::InitSchema(FileMetaData *md)
         col->schema_idx = cur;
         parent          = cur;
       }
+
+      // for nested types, our schema_index will be 
+
+      PRINTF("column[%d] schema idx : %d\n", (int)j, (int)col->schema_idx);
     }
   }
   return true;
 }
+*/
 
 /**
  * @brief Populates each node in the schema tree
@@ -331,7 +351,7 @@ bool CompactProtocolReader::InitSchema(FileMetaData *md)
  * @param[in] max_rep_level Max repetition level
  *
  * @return The node index that was populated
- **/
+ */
 int CompactProtocolReader::WalkSchema(
   std::vector<SchemaElement> &schema, int idx, int parent_idx, int max_def_level, int max_rep_level)
 {
@@ -362,11 +382,9 @@ int CompactProtocolReader::WalkSchema(
   }
 }
 
-/* ----------------------------------------------------------------------------*/
 /**
  * @Brief Parquet CompactProtocolWriter class
  **/
-/* ----------------------------------------------------------------------------*/
 
 #define CPW_BEGIN_STRUCT(st)                       \
   size_t CompactProtocolWriter::write(const st *s) \
