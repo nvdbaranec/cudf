@@ -65,12 +65,19 @@ struct PageInfo {
   uint8_t encoding;                // Encoding for data or dictionary page
   uint8_t definition_level_encoding;  // Encoding used for definition levels (data page)
   uint8_t repetition_level_encoding;  // Encoding used for repetition levels (data page)
-  int32_t valid_count;  // Count of valid (non-null) values in this page (negative values indicate
+  int32_t _valid_count;  // Count of valid (non-null) values in this page (negative values indicate
                         // data error)
 };
 
 // bit indicating (in the col_remap field) if this remap level indicates a repeated field
 constexpr int32_t REPEATED_FIELD_BIT = (1<<31);
+
+// information about each level of nesting within the column.
+struct ColumnNestingInfo {
+  int32_t         remap;
+  int32_t         size;
+  int32_t         null_count;
+};
 
 /**
  * @brief Struct describing a particular chunk of column data
@@ -93,8 +100,8 @@ struct ColumnChunkDesc {
                                      int8_t decimal_scale_,
                                      int32_t ts_clock_rate_,
                                      int32_t col_index_,
-                                     int32_t *col_remap_,
-                                     int32_t *col_sizes_)
+                                     ColumnNestingInfo *nesting_
+                                     )
     : compressed_data(compressed_data_),
       compressed_size(compressed_size_),
       num_values(num_values_),
@@ -116,8 +123,7 @@ struct ColumnChunkDesc {
       decimal_scale(decimal_scale_),
       ts_clock_rate(ts_clock_rate_),
       col_index(col_index_),
-      col_remap(col_remap_),
-      col_sizes(col_sizes_)      
+      nesting(nesting_)
   {
   }
 
@@ -136,18 +142,16 @@ struct ColumnChunkDesc {
   int32_t max_num_pages;        // size of page_info array
   PageInfo *page_info;          // output page info for up to num_dict_pages +
                                 // num_data_pages (dictionary pages first)
-  nvstrdesc_s *str_dict_index;  // index for string dictionary
-  // TODO : make this dynamic
-  uint32_t *valid_map_base[8];  // base pointers of valid bit map for this column
-  void *column_data_base;       // base pointer of leaf column data
+  nvstrdesc_s *str_dict_index;  // index for string dictionary  
+  uint32_t **valid_map_base;    // base pointers of valid bit map for this column
+  void **column_data_base;      // base pointer of column data
   int8_t codec;                 // compressed codec enum
   int8_t converted_type;        // converted type enum
   int8_t decimal_scale;         // decimal scale pow(10, -decimal_scale)
   int32_t ts_clock_rate;        // output timestamp clock frequency (0=default, 1000=ms, 1000000000=ns)  
   
   int32_t col_index;            // debug  
-  int32_t *col_remap;
-  int32_t *col_sizes;
+  ColumnNestingInfo *nesting;
 };
 
 /**

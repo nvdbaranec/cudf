@@ -155,7 +155,7 @@ class reader::impl {
                         size_t min_row,
                         size_t total_rows,
                         const std::vector<int> &chunk_map,
-                         std::vector<std::vector<column_buffer>>& out_buffers,
+                         std::vector<column_buffer>& out_buffers,
                         cudaStream_t stream);
 
  private:

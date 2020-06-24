@@ -99,11 +99,13 @@ class hostdevice_vector {
   void host_to_device(cudaStream_t stream)
   {
     cudaMemcpyAsync(d_data.data(), h_data, memory_size(), cudaMemcpyHostToDevice, stream);
-  }
+    cudaStreamSynchronize(stream);
+  }  
 
   void device_to_host(cudaStream_t stream)
   {
     cudaMemcpyAsync(h_data, d_data.data(), memory_size(), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
   }
 
  private:

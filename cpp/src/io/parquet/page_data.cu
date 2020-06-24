@@ -15,6 +15,7 @@
  */
 
 #include <cudf/detail/utilities/release_assert.cuh>
+#include <cudf/utilities/bit.hpp>
 #include <io/utilities/block_utils.cuh>
 #include <thrust/tuple.h>
 #include "parquet_gpu.h"
@@ -38,10 +39,10 @@ struct page_state_s {
   const uint8_t *lvl_start[2];  // [def,rep]
   const uint8_t *data_start;
   const uint8_t *data_end;
-  uint32_t *valid_map;
+  uint32_t **valid_map;
   const uint8_t *dict_base;  // ptr to dictionary page data
   int32_t dict_size;         // size of dictionary data
-  uint8_t *data_out;
+  uint8_t **data_out;
   int32_t valid_map_offset;  // offset in valid_map, in bits
   uint32_t out_valid;
   uint32_t out_valid_mask;
@@ -69,7 +70,7 @@ struct page_state_s {
   int32_t ts_scale;     // timestamp scale: <0: divide by -ts_scale, >0: multiply by ts_scale
   uint32_t rep[NZ_BFRSZ];
   uint32_t def[NZ_BFRSZ];
-  uint32_t nz_idx[NZ_BFRSZ]; // circular buffer of non-null row positions
+  uint32_t nz_idx[NZ_BFRSZ]; // circular buffer of non-null value positions
   uint32_t dict_idx[NZ_BFRSZ];  // Dictionary index, boolean, or string offset values
   uint32_t str_len[NZ_BFRSZ];   // String length for plain encoding of strings
 };
@@ -387,7 +388,7 @@ __device__ thrust::tuple<int, int, int> gpuDecodeLevels(uint32_t *output, page_s
   */
    if(lvl == level_type::DEFINITION){ 
      s->value_count      = value_count;
-     s->nz_count         = coded_count;
+     // s->nz_count         = coded_count;
    }
 
   return {value_count, coded_count, batch_coded_count};
@@ -1004,7 +1005,7 @@ static __device__ bool setupLocalPageInfo(page_state_s *const s,
     s->num_values     = 0;
     size_t min_value = min_row;
 
-    s->page.valid_count = 0;
+    // s->page.valid_count = 0;
     s->error            = 0;
     if (s->page.num_values > 0 && s->page.num_rows > 0) {
       uint8_t *cur           = s->page.page_data;
@@ -1056,9 +1057,14 @@ static __device__ bool setupLocalPageInfo(page_state_s *const s,
       } else if ((s->col.data_type & 7) == INT96) {
         s->dtype_len = 8;  // Convert to 64-bit timestamp
       }
-      // Setup local valid map and compute first & num rows relative to the current page
-      s->data_out         = reinterpret_cast<uint8_t *>(s->col.column_data_base);
-      s->valid_map        = s->col.valid_map_base[s->col.max_level[level_type::REPETITION]];
+      // Setup local valid map and compute first & num rows relative to the current page      
+      s->data_out         = reinterpret_cast<uint8_t **>(s->col.column_data_base);
+      s->valid_map        = s->col.valid_map_base;      
+      printf("D %lu %lu\n", (uint64_t)s->valid_map, (uint64_t)s->data_out);
+      if(s->valid_map != nullptr){
+        printf("D %lu %lu\n", (uint64_t)s->valid_map[0], (uint64_t)s->data_out[0]);
+        printf("D %lu %lu\n", (uint64_t)s->valid_map[1], (uint64_t)s->data_out[1]);
+      }      
       s->valid_map_offset = 0;
 
       // ROW VALUE      
@@ -1148,16 +1154,16 @@ static __device__ bool setupLocalPageInfo(page_state_s *const s,
   return true;
 }
 
-constexpr int column_watch = 2;
+constexpr int column_watch = 0;
 
 // now we have to transform that into actual row size information
-static __device__ void gpuComputeColumnSizes(page_state_s *s, int t)
+static __device__ void gpuComputeColumnSizes(page_state_s *s, int batch_coded_count, int t)
 {    
   // TODO : make this actually parallel
   if(!t){ 
-    for(int idx=0; idx<s->nz_count; idx++){
+    for(int idx=0; idx<batch_coded_count; idx++){
       int start_col_index = s->rep[idx];
-      int end_col_index = s->col.col_remap[s->def[idx]] & (~REPEATED_FIELD_BIT);
+      int end_col_index = s->col.nesting[s->def[idx]].remap & (~REPEATED_FIELD_BIT);
       /*
       if(s->col.col_index == column_watch){
         bool is_valid = (!d || (s->col.col_remap[d] & REPEATED_FIELD_BIT)) ? false : true;
@@ -1165,13 +1171,13 @@ static __device__ void gpuComputeColumnSizes(page_state_s *s, int t)
       }
       */
       for(int s_idx=start_col_index; s_idx<=end_col_index; s_idx++){
-        s->col.col_sizes[s_idx]++;
+        s->col.nesting[s_idx].size++;
       }       
     }
     
     if(s->col.col_index == column_watch){
       for(int idx=0; idx< s->col.max_level[level_type::DEFINITION]; idx++){
-        printf("col_size[%d] : %d\n", idx, s->col.col_sizes[idx]);
+        printf("col_size[%d] : %d\n", idx, s->col.nesting[idx].size);
       }
     }    
   }  
@@ -1198,10 +1204,7 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuPreprocessNestingData(
     out_thread0 =
       ((s->col.data_type & 7) == BOOLEAN || (s->col.data_type & 7) == BYTE_ARRAY) ? 64 : 32;
   }
-
-  //__shared__ uint32_t rep[NZ_BFRSZ];
-  //__shared__ uint32_t def[NZ_BFRSZ];
-
+  
   while (!s->error && (s->value_count < s->num_values)) {
     int target_pos;
     int out_pos = s->out_pos;
@@ -1212,69 +1215,108 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuPreprocessNestingData(
     if (t < 32) {
       // decode repetition and definition levels      
       gpuDecodeLevels(s->rep, s, target_pos, t, level_type::REPETITION);
-      gpuDecodeLevels(s->def, s, target_pos, t, level_type::DEFINITION); 
+      int value_count, coded_count, batch_coded_count;
+      thrust::tie(value_count, coded_count, batch_coded_count) = gpuDecodeLevels(s->def, s, target_pos, t, level_type::DEFINITION); 
+
+      // transform repetition and definition levels into final row sizes
+      gpuComputeColumnSizes(s, batch_coded_count, t);
     } 
     __syncthreads();
   }  
-  __syncthreads();  
-
-  // transform repetition and definition levels into final row sizes
-  gpuComputeColumnSizes(s, t);
+  __syncthreads();    
 }
 
 // now we have to transform that into actual row size information
-static __device__ void gpuComputeValidityAndRowIndices(uint32_t *rep, uint32_t *def, int value_count, int coded_count, int batch_coded_count, page_state_s *s, int t)
+static __device__ void gpuComputeValidityAndRowIndices(uint32_t *rep, uint32_t *def, int batch_coded_count, int coded_count, int start_pos, page_state_s *s, int t)
 {    
   // TODO : make this actually parallel
   if(!t){
-    int index_count[4] = {0, 0, 0, 0};
-    int valid_index[4] = {0, 0, 0, 0};
-    int indices[4][64];
-    int valid[4][64];
-    
+    // these will need to be scaled by nesting depth
+    int index_count[64] = {0, 0, 0, 0};
+    int valid_index[64] = {0, 0, 0, 0};
+    //int valids[6][64];
+    int value_count = 0;
+    // int nzs[64];
+
+    /*    
     for(int idx=0; idx<4; idx++){
       for(int s_idx=0; s_idx<64; s_idx++){
         valid[idx][s_idx] = 9;
       }
-    }    
+    } 
+    */
 
+    int value_col_index = s->col.max_level[level_type::REPETITION];
+    printf("BCC : %d %d %d\n", batch_coded_count, coded_count, start_pos);
     for(int idx=0; idx<batch_coded_count; idx++){ 
       int r = s->rep[idx];
       int d = s->def[idx];
       int start_col_index = r;
-      int end_col_index = s->col.col_remap[d] & (~REPEATED_FIELD_BIT);
+      int end_col_index = s->col.nesting[d].remap & (~REPEATED_FIELD_BIT);
       // if the field at this definition level is "repeated" it implies the element we
       // are adding is NULL. so the max_valid_index is the level before us.
       // if the definition level is 0, everything is null
-      int max_valid_index = d == 0 ? -1 : (s->col.col_remap[d] & REPEATED_FIELD_BIT) ? end_col_index-1 : end_col_index;      
-            
-      if(s->col.col_index == column_watch){        
-        printf("r/d : %d/%d (%d, %d, %d)\n", r, d, start_col_index, end_col_index, max_valid_index);
-      }                             
-      for(int s_idx=start_col_index; s_idx<=end_col_index; s_idx++){
-        // adding a new element. is it null or not?
-        if(s_idx <= max_valid_index){      
-          valid[s_idx][valid_index[s_idx]] = true;
+      int max_valid_index = d == 0 ? -1 : (s->col.nesting[d].remap & REPEATED_FIELD_BIT) ? end_col_index-1 : end_col_index;
+      
+      // generate validity and offsets       
+      for(int s_idx=start_col_index; s_idx<=end_col_index; s_idx++){       
+        // validity/row-indices
+        if(s_idx <= max_valid_index){
+          cudf::set_bit_unsafe(s->valid_map[s_idx], valid_index[s_idx]); 
+          
+          if(s_idx == value_col_index){            
+            s->nz_idx[(s->nz_count++) & (NZ_BFRSZ - 1)] = value_count;
+          }
         } else {
-          valid[s_idx][valid_index[s_idx]] = false;
+          cudf::clear_bit_unsafe(s->valid_map[s_idx], valid_index[s_idx]);
+          s->col.nesting[s_idx].null_count++;
+        }
+        if(s_idx == value_col_index){
+          value_count++;
         }
         valid_index[s_idx]++;
-      } 
-    } 
-    if(s->col.col_index == column_watch){       
-      for(int idx=0; idx<=s->col.max_level[level_type::REPETITION]; idx++){
-        printf("valids[%d] ", idx);
-        for(int s_idx=0; s_idx<s->col.col_sizes[idx]; s_idx++){
-          printf("%d", valid[idx][s_idx]);
-        }
-        printf("\n");
+      
+        // offsets        
+        (reinterpret_cast<int**>(s->data_out))[s_idx][index_count[s_idx]] = index_count[s_idx+1];         
+        index_count[s_idx]++;
+      }
+    }
+
+    if(batch_coded_count > 0){
+      // final offset value.
+      if(s->col.col_index == column_watch){
+        //printf("end_col_index : %d %s\n", end_col_index);
+      }
+      for(int s_idx=0; s_idx<=s->col.max_level[level_type::REPETITION]; s_idx++){      
+        (reinterpret_cast<int**>(s->data_out))[s_idx][index_count[s_idx]] = index_count[s_idx+1];   
       }
 
-      for(int idx=0; idx< s->col.max_level[level_type::DEFINITION]; idx++){
-        printf("col_size[%d] : %d\n", idx, s->col.col_sizes[idx]);
-      }
+      if(s->col.col_index == column_watch){
+        for(int idx=0; idx<=s->col.max_level[level_type::REPETITION]; idx++){
+          printf("null_count[%d] %d\n", idx, s->col.nesting[idx].null_count);
+          printf("valids[%d] ", idx);
+          for(int s_idx=0; s_idx<s->col.nesting[idx].size; s_idx++){
+            printf("%d", bit_is_set(s->valid_map[idx], s_idx) ? 1 : 0);
+          }
+          printf("\n");          
+        }
+
+        for(int idx=0; idx<s->col.max_level[level_type::REPETITION]; idx++){
+          printf("offsets[%d] ", idx);
+          for(int s_idx=0; s_idx<s->col.nesting[idx].size+1; s_idx++){
+            printf("%d, ", (reinterpret_cast<int**>(s->data_out))[idx][s_idx]);
+          }
+          printf("\n");
+        }
+
+        printf("vals : ");
+        for(int idx=0; idx<s->nz_count; idx++){
+          printf("%d, ", s->nz_idx[idx]);
+        }
+        printf("\n");
+      }    
     }    
-  }  
+  }    
 }
 
 /**
@@ -1311,10 +1353,7 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
   } else {
     out_thread0 =
       ((s->col.data_type & 7) == BOOLEAN || (s->col.data_type & 7) == BYTE_ARRAY) ? 64 : 32;
-  }
-
-  __shared__ uint32_t rep[NZ_BFRSZ];
-  __shared__ uint32_t def[NZ_BFRSZ];
+  }  
 
   int loop = 0;
   while (!s->error && (s->value_count < s->num_values || s->out_pos < s->nz_count)) {
@@ -1330,14 +1369,14 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
     }
     __syncthreads();
     if (t < 32) {
-      // WARP0: Decode definition and repetition levels, outputs row indices      
+      // WARP0: Decode definition and repetition levels, outputs row indices
+      int start_pos = s->nz_count;
       int value_count, coded_count, batch_coded_count;
       if(has_nesting){
-        gpuDecodeLevels(rep, s, target_pos, t, level_type::REPETITION);
-      }            
-      thrust::tie(value_count, coded_count, batch_coded_count) = gpuDecodeLevels(def, s, target_pos, t, level_type::DEFINITION);
-
-      gpuComputeValidityAndRowIndices(rep, def, value_count, coded_count, batch_coded_count, s, t);
+        gpuDecodeLevels(s->rep, s, target_pos, t, level_type::REPETITION);
+      }
+      thrust::tie(value_count, coded_count, batch_coded_count) = gpuDecodeLevels(s->def, s, target_pos, t, level_type::DEFINITION);
+      gpuComputeValidityAndRowIndices(s->rep, s->def, batch_coded_count, coded_count, start_pos, s, t);
     } else if (t < out_thread0) {
       // WARP1: Decode dictionary indices, booleans or string positions
       if (s->dict_base) {
@@ -1353,9 +1392,13 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
       int dtype = s->col.data_type & 7;
       out_pos += t - out_thread0;
       int value_idx = s->nz_idx[out_pos & (NZ_BFRSZ - 1)];
+
+      int value_level_index = s->col.max_level[level_type::REPETITION];
+      //printf("VLL : %d\n", value_level_index);
+      
       if (out_pos < target_pos && value_idx >= 0 && s->first_value + value_idx < s->num_values) {
-        uint32_t dtype_len = s->dtype_len;
-        uint8_t *dst       = s->data_out + (size_t)value_idx * dtype_len;        
+        uint32_t dtype_len = s->dtype_len;        
+        uint8_t *dst       = s->data_out[value_level_index] + (size_t)value_idx * dtype_len;        
         if (dtype == BYTE_ARRAY)
           gpuOutputString(s, out_pos, dst);
         else if (dtype == BOOLEAN)
@@ -1382,12 +1425,14 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
   if (!t) {
     // Update the number of rows (after cropping to [min_row, min_row+num_rows-1]), and number of
     // valid values
-
+   
     // ROW VALUE
     pages[page_idx].num_rows    = s->_num_rows - s->_first_row;    
+
+    printf("END NULLS : %d %d\n", s->col.nesting[0].null_count, s->col.nesting[1].null_count);
     // pages[page_idx].num_values = s->num_values - s->first_value;    
 
-    pages[page_idx].valid_count = (s->error) ? -s->error : s->page.valid_count;
+    // pages[page_idx].valid_count = (s->error) ? -s->error : s->page.valid_count;
   }
 }
 

@@ -287,7 +287,6 @@ PARQUET_END_STRUCT()
  *
  * @return True if schema constructed completely, false otherwise
  */
-/*
 bool CompactProtocolReader::InitSchema(FileMetaData *md)
 {
   int final_pos = WalkSchema(md->schema);
@@ -296,14 +295,14 @@ bool CompactProtocolReader::InitSchema(FileMetaData *md)
   size_t idx;
   
   for(idx=0; idx<md->schema.size(); idx++){
-    PRINTF("Schema[%d] type : %d, converted type : %d, name %s, parent : %d, repetition : %d, rep max : %d \n", (int)idx, 
+    printf("Schema[%d] type : %d, converted type : %d, name %s, parent : %d, repetition : %d, rep max : %d \n", (int)idx, 
               md->schema[idx].type,
               md->schema[idx].converted_type,
               md->schema[idx].name.c_str(),
               md->schema[idx].parent_idx,
               (int)md->schema[idx].repetition_type,
               md->schema[idx].max_repetition_level);
-  }
+  }  
 
   // Map columns to schema
   for (size_t i = 0; i < md->row_groups.size(); i++) {
@@ -311,7 +310,7 @@ bool CompactProtocolReader::InitSchema(FileMetaData *md)
     int cur     = 0;
     for (size_t j = 0; j < g->columns.size(); j++) {
       ColumnChunk *col = &g->columns[j];
-      int parent       = 0;  // root of schema
+      int parent       = 0;  // root of schema      
       for (size_t k = 0; k < col->meta_data.path_in_schema.size(); k++) {
         bool found = false;
         int pos = cur + 1, maxpos = (int)md->schema.size();
@@ -327,19 +326,27 @@ bool CompactProtocolReader::InitSchema(FileMetaData *md)
           }
           pos++;
         }
-        if (!found) { return false; }
-        col->schema_idx = cur;
+        if (!found) { return false; }        
+        
+        col->leaf_schema_idx = cur;
         parent          = cur;
+        
+        // if the schema index is already pointing at a nested type, we'll leave it alone.
+        if(col->schema_idx < 0 || md->schema[col->schema_idx].converted_type != parquet::LIST){
+          col->schema_idx = cur;
+        }
       }
 
+      printf("CSIL : %d %d\n", col->schema_idx, col->leaf_schema_idx);
+
+      //printf("col %d -> schema %d\n", j, col->schema_idx);
       // for nested types, our schema_index will be 
 
-      PRINTF("column[%d] schema idx : %d\n", (int)j, (int)col->schema_idx);
+      //PRINTF("column[%d] schema idx : %d\n", (int)j, (int)col->schema_idx);
     }
   }
   return true;
 }
-*/
 
 /**
  * @brief Populates each node in the schema tree
@@ -363,6 +370,7 @@ int CompactProtocolReader::WalkSchema(
       ++max_def_level;
       ++max_rep_level;
     }
+    printf("SCHEMA : %d %d %d %d\n", idx, e->converted_type, max_def_level, max_rep_level);
     e->max_definition_level = max_def_level;
     e->max_repetition_level = max_rep_level;
     e->parent_idx           = parent_idx;
