@@ -18,7 +18,13 @@
 #include <cudf/utilities/bit.hpp>
 #include <io/utilities/block_utils.cuh>
 #include <thrust/tuple.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/transform_output_iterator.h>
+#include <thrust/scan.h>
+#include <rmm/thrust_rmm_allocator.h>
+
 #include "parquet_gpu.h"
+#include "printer.hpp"
 
 #include "printer.hpp"
 
@@ -31,48 +37,65 @@ inline __device__ uint32_t rotl32(uint32_t x, uint32_t r)
   return __funnelshift_l(x, x, r);  // (x << r) | (x >> (32 - r));
 };
 
+inline __device__ int rolling_index(int index)
+{
+  return index & (NZ_BFRSZ - 1);
+}
+
+constexpr int column_watch = 0;
+
 namespace cudf {
 namespace io {
 namespace parquet {
 namespace gpu {
+
+// this is definitely not sufficient.
+static constexpr int32_t max_nesting_depth = 4;
+
 struct page_state_s {
   const uint8_t *lvl_start[2];  // [def,rep]
   const uint8_t *data_start;
-  const uint8_t *data_end;
-  uint32_t **valid_map;
-  const uint8_t *dict_base;  // ptr to dictionary page data
-  int32_t dict_size;         // size of dictionary data
-  uint8_t **data_out;
-  int32_t valid_map_offset;  // offset in valid_map, in bits
-  uint32_t out_valid;
-  uint32_t out_valid_mask;
-  
-  // ROW VALUE
-  int32_t _first_row;     // First row in page to output
-  int32_t _num_rows;      // Rows in page to decode (including rows to be skipped)
-  int32_t first_value;    // First value in page to output
-  int32_t num_values;     // max number of values to decode
+  const uint8_t *data_end;  
+  const uint8_t *dict_base; // ptr to dictionary page data
+  int32_t dict_size;        // size of dictionary data
+    
+  int32_t first_row;        // First row in page to output
+  int32_t num_rows;         // Rows in page to decode (including rows to be skipped)
+  int32_t first_value;      // First value in page to output
+  int32_t num_values;       // max number of values to decode
 
-  int32_t value_count;    // number of values decoded (including NULLs)    
-  int32_t dtype_len;      // Output data type length
-  int32_t dtype_len_in;   // Can be larger than dtype_len if truncating 32-bit into 8-bit
-  int32_t dict_bits;      // # of bits to store dictionary indices
+  int32_t page_row_count;   // number of (top level) rows decoded in the page
+  int32_t page_value_count; // number of values decoded in the page
+  int32_t value_count[max_nesting_depth]; // of of values decoded by column
+  int32_t valid_count[max_nesting_depth]; // # of validity bits decoded by column
+
+  int32_t dtype_len;        // Output data type length
+  int32_t dtype_len_in;     // Can be larger than dtype_len if truncating 32-bit into 8-bit
+  int32_t dict_bits;        // # of bits to store dictionary indices
   uint32_t dict_run;
   int32_t dict_val;
   uint32_t initial_rle_run[2];   // [def,rep]
   int32_t initial_rle_value[2];  // [def,rep]
   int32_t error;
   PageInfo page;
-  ColumnChunkDesc col;  
+  ColumnChunkDesc col;    
+
+  // only used in the preprocess step
+  uint32_t **valid_map;
+
+  // only used in the decode step
+  uint8_t **data_out;
   int32_t nz_count;     // number of valid entries in nz_idx (write position in circular buffer)
   int32_t dict_pos;     // write position of dictionary indices
   int32_t out_pos;      // read position of final output
-  int32_t ts_scale;     // timestamp scale: <0: divide by -ts_scale, >0: multiply by ts_scale
-  uint32_t rep[NZ_BFRSZ];
-  uint32_t def[NZ_BFRSZ];
+  int32_t ts_scale;     // timestamp scale: <0: divide by -ts_scale, >0: multiply by ts_scale  
   uint32_t nz_idx[NZ_BFRSZ]; // circular buffer of non-null value positions
   uint32_t dict_idx[NZ_BFRSZ];  // Dictionary index, boolean, or string offset values
-  uint32_t str_len[NZ_BFRSZ];   // String length for plain encoding of strings
+  uint32_t str_len[NZ_BFRSZ];   // String length for plain encoding of strings      
+
+  // used in both steps
+  uint32_t rep[NZ_BFRSZ];
+  uint32_t def[NZ_BFRSZ];
 };
 
 /**
@@ -221,29 +244,19 @@ __device__ uint32_t InitLevelSection(
  * @param[in] t Warp0 thread ID (0..31)
  * @param[in] lvl The level type we are decoding - DEFINITION or REPETITION
  */
-__device__ thrust::tuple<int, int, int> gpuDecodeLevels(uint32_t *output, page_state_s *s, int32_t target_count, int t, level_type lvl)
+__device__ int gpuDecodeLevels(uint32_t *output, page_state_s *s, int32_t target_count, int t, level_type lvl)
 {
   const uint8_t *cur_def    = s->lvl_start[lvl];
   const uint8_t *end        = s->data_start;
-  //uint32_t *valid_map       = s->valid_map;
-  //uint32_t valid_map_offset = s->valid_map_offset;
-  //uint32_t out_valid = s->out_valid, out_valid_mask = s->out_valid_mask;
-  
-  // ROW VALUE
-  // int32_t first_row   = s->_first_row;
-  // int32_t first_value = s->first_value;
-  int32_t first_value = s->_first_row;
-    
   uint32_t level_run    = s->initial_rle_run[lvl];
   int32_t level_val     = s->initial_rle_value[lvl];
-  int level_bits      = s->col.level_bits[lvl];  
+  int level_bits      = s->col.level_bits[lvl];
   int max_level       = s->col.max_level[lvl];
   int32_t num_values  = s->num_values;
-  int32_t value_count = s->value_count;  // Row offset of next value
-  int32_t coded_count = s->nz_count;     // Count of non-null values
+  int32_t page_value_count = s->page_value_count;  // Row offset of next value
   int32_t batch_coded_count = 0;
-  
-  while (coded_count < target_count && value_count < num_values) {
+
+  while (batch_coded_count < target_count && page_value_count < num_values) {
     int batch_len, is_valid;
     uint32_t valid_mask;
     if (level_run <= 1) {
@@ -270,7 +283,9 @@ __device__ thrust::tuple<int, int, int> gpuDecodeLevels(uint32_t *output, page_s
       cur_def += sym_len;
     }
     if (s->error) { break; }
-    batch_len = min(num_values - value_count, 32);
+
+    int remaining = target_count - batch_coded_count;
+    batch_len = min(remaining, min(num_values - page_value_count, 32));
     if (level_run & 1) {
       // Literal run
       int batch_len8;
@@ -295,103 +310,21 @@ __device__ thrust::tuple<int, int, int> gpuDecodeLevels(uint32_t *output, page_s
       // Repeated value
       batch_len = min(batch_len, level_run >> 1);
       level_run -= batch_len * 2;
-    }     
-    //if(lvl == level_type::DEFINITION){      
-      // is_valid   = (t < batch_len && level_val >= max_level);
-    //} else {
-      is_valid   = (t < batch_len);
-    //}
-    valid_mask = BALLOT(is_valid);
-    if (valid_mask) {
-      if (is_valid) {
-        /*
-          int idx                         = coded_count + __popc(valid_mask & ((1 << t) - 1));
-          int ofs                         = value_count + t - first_value;
-          printf("ROW (%s, t=%d) : %d, %d\n", lvl == level_type::REPETITION ? "rep" : "def", t, ofs, level_val);
-          s->nz_idx[idx & (NZ_BFRSZ - 1)] = ofs;
-        }
-        */
-        int idx                      = coded_count + __popc(valid_mask & ((1 << t) - 1));
-        output[idx & (NZ_BFRSZ - 1)] = level_val;
-      }
-      int this_count = __popc(valid_mask);
-      coded_count += this_count;
-      batch_coded_count += this_count;
     }
-    value_count += batch_len;
-    if (!t) {
-      // If needed, adjust batch length to eliminate rows before the first row
-      if (value_count < first_value + batch_len) {
-        if (value_count > first_value) {
-          // At least some values are above the first row
-          unsigned int skip_cnt = batch_len - (value_count - first_value);
-          valid_mask >>= skip_cnt;
-          batch_len -= skip_cnt;
-        } else  // All values are below the first row
-        {
-          batch_len  = 0;
-          valid_mask = 0;
-        }
-      }
-      /*
-      out_valid |= valid_mask << valid_map_offset;
-      valid_map_offset += batch_len;
-      if (valid_map_offset >= 32) {
-        if (valid_map) {
-          if (out_valid_mask == ~0)  // Safe to output all 32 bits are within the current page
-          {
-            *valid_map = out_valid;
-          } else  // Special case for the first valid row, which may not start on a 32-bit boundary
-                  // (only setting some of the bits)
-          {
-            atomicAnd(valid_map, ~out_valid_mask);
-            atomicOr(valid_map, out_valid);
-          }
-          valid_map++;
-        }
-        s->page.valid_count += __popc(out_valid);
-        valid_map_offset &= 0x1f;
-        out_valid =
-          (valid_map_offset > 0) ? valid_mask >> (unsigned int)(batch_len - valid_map_offset) : 0;
-        out_valid_mask = ~0;
-      }
-      */
-      __threadfence_block();
+    if(t < batch_len){
+      int idx                      = page_value_count + t;
+      output[idx & (NZ_BFRSZ - 1)] = level_val;
     }
+    batch_coded_count += batch_len;
+    page_value_count += batch_len;
   }
   if (!t) {
     s->lvl_start[lvl]         = cur_def;
     s->initial_rle_run[lvl]   = level_run;
-    s->initial_rle_value[lvl] = level_val;
+    s->initial_rle_value[lvl] = level_val;    
   }
 
-   /* 
-    if(lvl == level_type::DEFINITION){      
-      if (value_count >= num_values && valid_map_offset != 0) {
-        // Store the remaining valid bits at the end of the page
-        out_valid_mask &= (1 << valid_map_offset) - 1;
-        out_valid &= out_valid_mask;
-        s->page.valid_count += __popc(out_valid);
-        if (valid_map) {
-          atomicAnd(valid_map, ~out_valid_mask);
-          atomicOr(valid_map, out_valid);
-        }
-        out_valid_mask = 0;
-      }
-      s->valid_map_offset = valid_map_offset;
-      s->out_valid_mask   = out_valid_mask;
-      s->out_valid        = out_valid;
-      s->valid_map        = valid_map;      
-      s->value_count      = value_count;
-      s->nz_count         = coded_count;
-    }
-  */
-   if(lvl == level_type::DEFINITION){ 
-     s->value_count      = value_count;
-     // s->nz_count         = coded_count;
-   }
-
-  return {value_count, coded_count, batch_coded_count};
+  return batch_coded_count;
 }
 
 /**
@@ -588,12 +521,12 @@ __device__ void gpuInitStringDescriptors(volatile page_state_s *s, int target_po
  * @param[in] src_pos Source position
  * @param[in] dstv Pointer to row output data (string descriptor or 32-bit hash)
  */
-inline __device__ void gpuOutputString(volatile page_state_s *s, int src_pos, void *dstv)
+inline __device__ void gpuOutputString(volatile page_state_s *s, int src_pos, void *dstv, int value_idx)
 {
   const char *ptr = NULL;
   size_t len      = 0;
 
-  if (s->dict_base) {
+  if (s->dict_base) {   
     // String dictionary
     uint32_t dict_pos =
       (s->dict_bits > 0) ? s->dict_idx[src_pos & (NZ_BFRSZ - 1)] * sizeof(nvstrdesc_s) : 0;
@@ -613,11 +546,19 @@ inline __device__ void gpuOutputString(volatile page_state_s *s, int src_pos, vo
   if (s->dtype_len == 4) {
     // Output hash
     *reinterpret_cast<uint32_t *>(dstv) = device_str2hash32(ptr, len);
+
+     if(s->col.col_index == column_watch){
+      printf("A\n");
+    }
   } else {
     // Output string descriptor
     nvstrdesc_s *dst = reinterpret_cast<nvstrdesc_s *>(dstv);
     dst->ptr         = ptr;
     dst->count       = len;
+
+     if(s->col.col_index == column_watch){
+      printf("B %s (%lu) %lu %d\n", dst->ptr, (uint64_t)dst->ptr, len, value_idx);
+    }
   }
 }
 
@@ -975,7 +916,271 @@ static __device__ void gpuOutputGeneric(volatile page_state_s *s,
   }
 }
 
-static __device__ bool setupLocalPageInfo(page_state_s *const s,
+// --------------------------------------------
+
+// initialize the page_state_s struct based on the incoming PageInfo from the file
+static __device__ bool setupPreprocessLocalPageInfo(page_state_s *const s, PageInfo *pages, ColumnChunkDesc *chunks, int32_t min_row, int32_t num_rows, int32_t num_chunks)
+{
+  int page_idx          = blockIdx.x;
+  int t                 = threadIdx.x;
+  int chunk_idx;
+
+  // Fetch page info
+  // NOTE: Assumes that sizeof(PageInfo) <= 256 (and is padded to 4 bytes)
+  if (t < sizeof(PageInfo) / sizeof(uint32_t)) {
+    ((uint32_t *)&s->page)[t] = ((const uint32_t *)&pages[page_idx])[t];
+  }
+  __syncthreads();
+  if (s->page.flags & PAGEINFO_FLAGS_DICTIONARY) { return false; }
+  // Fetch column chunk info
+  chunk_idx = s->page.chunk_idx;
+  if ((uint32_t)chunk_idx < (uint32_t)num_chunks) {
+    // NOTE: Assumes that sizeof(ColumnChunkDesc) <= 256 (and is padded to 4 bytes)
+    if (t < sizeof(ColumnChunkDesc) / sizeof(uint32_t)) {
+      ((uint32_t *)&s->col)[t] = ((const uint32_t *)&chunks[chunk_idx])[t];
+    }
+  }
+  __syncthreads();
+
+  if(!t && s->col.col_index == column_watch){
+    int32_t page_start_row  = s->page.chunk_row;
+    printf("CHECK : %d\n", page_start_row);
+  }
+  
+  if (!t) { 
+    s->error          = 0;
+    if (s->page.num_values > 0) {
+      uint8_t *cur           = s->page.page_data;
+      uint8_t *end           = cur + s->page.uncompressed_page_size;
+
+      // IMPORTANT : the code in this if statement is only valid -after- s->page.num_rows and
+      // s->page.chunk_rows have been computed!
+      // adjust based on min_row/num_rows.
+      if(min_row >= 0){
+        if(s->col.col_index == column_watch){
+          printf("Row bounds 1 : %d, %d, %d, %d, %d, %d, %d\n", s->col.start_row, s->page.chunk_row, min_row, num_rows, s->page.num_rows, s->first_row, s->num_rows);
+        }
+        int32_t page_start_row  = s->page.chunk_row; // s->col.start_row; // + s->page.chunk_row;
+        if(s->col.col_index == column_watch){
+          printf("PSR : %d %d %d\n", page_start_row, s->col.start_row, s->page.chunk_row);
+        }
+
+        // first row within the page to start reading
+        if (page_start_row >= min_row) {
+          s->first_row = 0;
+        } else {
+          s->first_row = (int32_t)min(min_row - page_start_row, s->page.num_rows);
+        }
+
+        // # of rows within the page to read
+        s->num_rows   = s->page.num_rows;        
+        if (page_start_row + s->num_rows > min_row + num_rows) {
+          s->num_rows = (int32_t)max((int64_t)(min_row + num_rows - page_start_row), INT64_C(0));
+        }
+
+        if(s->col.col_index == column_watch){
+          printf("Row bounds 2 : %d, %d, %d, %d, %d, %d, %d, %d\n", s->col.start_row, s->page.chunk_row, page_start_row, min_row, num_rows, s->page.num_rows, s->first_row, s->num_rows);
+        }
+      }
+      
+      // Find the compressed size of repetition levels
+      cur += InitLevelSection(s, cur, end, level_type::REPETITION);
+      // Find the compressed size of definition levels
+      cur += InitLevelSection(s, cur, end, level_type::DEFINITION);
+
+      if (cur > end) { s->error = 1; }
+      s->data_start = cur;
+      s->data_end   = end;
+    } else {
+      s->error = 1;
+    }
+    s->page_value_count = 0;
+    s->page_row_count = 0;
+    s->nz_count = 0;
+    s->first_value = 0;
+    s->num_values = s->page.num_values;
+    __threadfence_block();
+  }
+  __syncthreads();
+
+  return true;
+}
+
+// computes:
+// PageInfo::num_rows
+static __device__ void gpuUpdatePageRowCount(page_state_s *s, int batch_coded_count, int t)
+{
+  if(t < batch_coded_count){
+    int index = rolling_index(s->page_value_count + t);
+    int start_col_index = s->rep[index];
+    // a repetition level of 0 means "new record at the top level" which
+    // corresponds to a real row from the perspective of the page.
+    if(start_col_index == 0){
+      atomicAdd(&s->page.num_rows, 1);
+    }
+  }
+}
+
+// blockDim {NTHREADS,1,1}
+extern "C" __global__ void __launch_bounds__(NTHREADS) gpuComputeRowCounts(
+  PageInfo *pages, ColumnChunkDesc *chunks, int32_t num_chunks)
+{  
+  __shared__ __align__(16) page_state_s state_g;
+
+  page_state_s *const s = &state_g;
+  int page_idx          = blockIdx.x;   
+  int t                 = threadIdx.x;
+  int out_thread0;
+
+  if(!setupPreprocessLocalPageInfo(s, pages, chunks, -1, -1, num_chunks)){    
+    return;
+  }
+
+  if(!t){
+    printf("ROW COUNTS\n");
+  }
+
+  // s->value_count is incremented when we cann gpuDecodeLevels(level_type::DEFINITION)
+  while (!s->error && (s->page_value_count < s->num_values)) { 
+    // TODO : right now gpuDecodeLevels() expects that it will only ever be executed
+    // on one warp, with t < 32. in the data decoding step it is done this way to
+    // let the larger # of threads actually decode values.  However, the # of repetition
+    // and definition levels is the same length as the # of values, so it is quite
+    // inefficient to have only 32 threads doing work (if we had, say, a billion values)
+    if(t < 32){
+      // decode repetition and definition levels    
+      int bcc0 = gpuDecodeLevels(s->rep, s, 32, t, level_type::REPETITION);    
+      int bcc1 = gpuDecodeLevels(s->def, s, 32, t, level_type::DEFINITION); 
+
+      __syncthreads();
+
+      // compute total row count for the page
+      gpuUpdatePageRowCount(s, bcc1, t);
+
+      __syncthreads();
+
+      if(!t){        
+        s->page_value_count += bcc1;
+        if(s->col.col_index == column_watch){
+          printf("LOOP %d %d\n", bcc0, bcc1);
+        }
+      }
+    }
+
+    __syncthreads();
+  }
+
+  // copy the final output
+  if(!t){
+    pages[page_idx].num_rows = s->page.num_rows;
+    if(s->col.col_index == column_watch){
+      printf("Row count, column %d : %d\n", s->col.col_index, pages[page_idx].num_rows);
+    }
+  }
+}
+
+static __device__ void gpuUpdateColumnSizes(page_state_s *s, int batch_coded_count, int t)
+{    
+  // TODO : make this actually parallel
+  if(!t){
+    if(s->col.col_index == column_watch){
+      printf("GUCS %d, %d\n", batch_coded_count, s->num_values);
+    }
+    for(int idx=0; idx<batch_coded_count; idx++){
+      int index = rolling_index(s->page_value_count + idx);
+      int start_col_index = s->rep[index];
+      int end_col_index = s->col.nesting[s->def[index]].remap & (~REPEATED_FIELD_BIT);
+      if(s->col.col_index == column_watch){
+        printf("R / D : %d %d %d\n", s->rep[index], s->def[index], index);
+      }
+      for(int s_idx=start_col_index; s_idx<=end_col_index; s_idx++){
+        // count rows we've visited
+        if(s_idx == 0){
+          s->page_row_count++;
+        }  
+        
+        int32_t row_index = (s->page_row_count - s->first_row) - 1;
+        
+        // if we've processed the rows we care about, we're done
+        /*
+        if(row_index >= s->num_rows){
+          return;
+        }
+        */
+
+        // if we're at or beyond the first row we care about
+        if(s->col.col_index == column_watch){
+          //printf("UCS : %d, %d, %d\n", s_idx, row_index, s->first_row);
+        }
+        if(row_index >= s->first_row){ 
+          printf("%lu\n", (uint64_t)s->col.nesting);
+          s->col.nesting[s_idx].size++;
+        }
+      }
+    }            
+  }  
+}
+
+// blockDim {NTHREADS,1,1}
+extern "C" __global__ void __launch_bounds__(NTHREADS) gpuComputeColumnSizes(
+  PageInfo *pages, ColumnChunkDesc *chunks, int32_t min_row, int32_t num_rows, int32_t num_chunks)
+{  
+  __shared__ __align__(16) page_state_s state_g;
+
+  page_state_s *const s = &state_g;
+  int page_idx          = blockIdx.x;   
+  int t                 = threadIdx.x;
+  int out_thread0;
+
+  if(!setupPreprocessLocalPageInfo(s, pages, chunks, min_row, num_rows, num_chunks)){
+    return;
+  }
+
+  if(!t){
+    printf("COLUMN SIZES\n");
+  }
+
+  // s->row_count is incremented when we call gpu
+  while (!s->error && (s->page_value_count < s->num_values)) { 
+    // TODO : right now gpuDecodeLevels() expects that it will only ever be executed
+    // on one warp, with t < 31. in the data decoding step it is done this way to
+    // let the larger # of threads actually decode values.  However, the # of repetition
+    // and definition levels is the same length as the # of values, so it is quite
+    // inefficient to have only 32 threads doing work (if we had, say, a billion values)
+    if(t < 32){
+      // decode repetition and definition levels
+      gpuDecodeLevels(s->rep, s, 32, t, level_type::REPETITION);
+      int batch_coded_count = gpuDecodeLevels(s->def, s, 32, t, level_type::DEFINITION);
+
+      __syncthreads();
+
+      // update column size buffers
+      gpuUpdateColumnSizes(s, batch_coded_count, t);
+      
+      __syncthreads();
+
+      if(!t){        
+        s->page_value_count += batch_coded_count;
+      }
+      
+      __syncthreads();
+    }
+    __syncthreads();
+  }
+
+  if(!t && s->col.col_index == column_watch){    
+    printf("Column %d:\n", s->col.col_index);
+    for(int idx=0; idx<s->col.max_level[level_type::DEFINITION]; idx++){
+      printf("   col_size[%d] : %d\n", idx, s->col.nesting[idx].size);
+    }
+  }     
+}
+
+// --------------------------------------------
+
+
+
+static __device__ bool setupDecodeLocalPageInfo(page_state_s *const s,
   PageInfo *pages, ColumnChunkDesc *chunks, size_t min_row, size_t num_rows, int32_t num_chunks)
 {
   int page_idx          = blockIdx.x;
@@ -997,23 +1202,23 @@ static __device__ bool setupLocalPageInfo(page_state_s *const s,
       ((uint32_t *)&s->col)[t] = ((const uint32_t *)&chunks[chunk_idx])[t];
     }
   }
-  __syncthreads();  
+
+  // zero nested value and valid counts
+  if(t < max_nesting_depth){
+    s->value_count[t] = 0;
+    s->valid_count[t] = 0;
+  }
+  __syncthreads();
 
   if (!t) {
-    // ROW VALUE
-    s->_num_rows      = 0;
-    s->num_values     = 0;
-    size_t min_value = min_row;
-
-    // s->page.valid_count = 0;
-    s->error            = 0;
+    printf("DECODE R / V for column %d : %d %d %d\n", s->col.col_index, s->page.num_rows, s->page.num_values, s->page.chunk_row);
+    s->error          = 0;
     if (s->page.num_values > 0 && s->page.num_rows > 0) {
       uint8_t *cur           = s->page.page_data;
       uint8_t *end           = cur + s->page.uncompressed_page_size;
       
       // ROW VALUE
       size_t page_start_row  = s->col.start_row + s->page.chunk_row;
-      size_t page_start_value = page_start_row;
 
       uint32_t dtype_len_out = s->col.data_type >> 3;
       s->ts_scale            = 0;
@@ -1057,51 +1262,27 @@ static __device__ bool setupLocalPageInfo(page_state_s *const s,
       } else if ((s->col.data_type & 7) == INT96) {
         s->dtype_len = 8;  // Convert to 64-bit timestamp
       }
-      // Setup local valid map and compute first & num rows relative to the current page      
+      // data and validity pointers
       s->data_out         = reinterpret_cast<uint8_t **>(s->col.column_data_base);
-      s->valid_map        = s->col.valid_map_base;      
-      printf("D %lu %lu\n", (uint64_t)s->valid_map, (uint64_t)s->data_out);
-      if(s->valid_map != nullptr){
-        printf("D %lu %lu\n", (uint64_t)s->valid_map[0], (uint64_t)s->data_out[0]);
-        printf("D %lu %lu\n", (uint64_t)s->valid_map[1], (uint64_t)s->data_out[1]);
-      }      
-      s->valid_map_offset = 0;
+      s->valid_map        = s->col.valid_map_base;
 
-      // ROW VALUE      
-      if (page_start_row >= min_row) {        
-        if (s->data_out) { s->data_out += (page_start_value - min_value) * s->dtype_len; }
-        if (s->valid_map) { s->valid_map += (page_start_value - min_value) >> 5; }
-        s->valid_map_offset = (int32_t)((page_start_value - min_value) & 0x1f);
-        
-        s->_first_row        = 0;
-        s->first_value      = 0;
-      } else  // First row starts after the beginning of the page
-      {
-        s->_first_row = (int32_t)min(min_row - page_start_row, (size_t)s->page.num_rows);
-        // need to figure out how to actually compute this! this will totally not work as is.
-        release_assert(false && "Cannot currently handle starting at non-zero rows");
-        s->first_value = s->_first_row;
-      }            
+      // first row within the page to start reading
+      if (page_start_row >= min_row) {
+        s->first_row = 0;
+      } else {
+        s->first_row = (int32_t)min(min_row - page_start_row, (size_t)s->page.num_rows);
+      }
 
-      // ROW VALUE
-      s->_num_rows   = s->page.num_rows;
-      s->num_values = s->page.num_values;
-      if (page_start_row + s->_num_rows > min_row + num_rows) {
-        s->_num_rows = (int32_t)max((int64_t)(min_row + num_rows - page_start_row), INT64_C(0));
-        // need to figure out how to actually compute this! this will totally not work as is.
-        release_assert(false && "Cannot currently handle starting at non-zero rows");
-        s->num_values = s->_num_rows;
+      // # of rows within the page to read
+      s->num_rows   = s->page.num_rows;
+      if (page_start_row + s->num_rows > min_row + num_rows) {
+        s->num_rows = (int32_t)max((int64_t)(min_row + num_rows - page_start_row), INT64_C(0));
       }
       
-      s->out_valid      = 0;
-      s->out_valid_mask = (~0) << s->valid_map_offset;            
-      
       // Find the compressed size of repetition levels
-      cur +=
-        InitLevelSection(s, cur, end, level_type::REPETITION);
+      cur += InitLevelSection(s, cur, end, level_type::REPETITION);
       // Find the compressed size of definition levels
-      cur +=
-        InitLevelSection(s, cur, end, level_type::DEFINITION);
+      cur += InitLevelSection(s, cur, end, level_type::DEFINITION);
       s->dict_bits = 0;
       s->dict_base = 0;
       s->dict_size = 0;
@@ -1139,14 +1320,14 @@ static __device__ bool setupLocalPageInfo(page_state_s *const s,
     } else {
       s->error = 1;
     }
-    s->value_count = 0;
-    s->nz_count    = 0;
-    s->dict_pos    = 0;
-    s->out_pos     = 0;
+    s->page_value_count = 0;    
+    s->page_row_count = 0;
+    s->nz_count = 0;
+    s->first_value = 0;
+    s->num_values = s->page.num_values;    
+    s->dict_pos = 0;
+    s->out_pos = 0;
 
-    // ROW VALUE
-    // s->num_values  = min(s->page.num_values, s->_num_rows);
-    s->num_values = s->page.num_values;
     __threadfence_block();
   }
   __syncthreads();
@@ -1154,143 +1335,84 @@ static __device__ bool setupLocalPageInfo(page_state_s *const s,
   return true;
 }
 
-constexpr int column_watch = 0;
-
 // now we have to transform that into actual row size information
-static __device__ void gpuComputeColumnSizes(page_state_s *s, int batch_coded_count, int t)
-{    
-  // TODO : make this actually parallel
-  if(!t){ 
-    for(int idx=0; idx<batch_coded_count; idx++){
-      int start_col_index = s->rep[idx];
-      int end_col_index = s->col.nesting[s->def[idx]].remap & (~REPEATED_FIELD_BIT);
-      /*
-      if(s->col.col_index == column_watch){
-        bool is_valid = (!d || (s->col.col_remap[d] & REPEATED_FIELD_BIT)) ? false : true;
-        printf("r/d : %d/%d (%d, %d)\n", r, d, output_col_index, is_valid ? 1 : 0);
-      }
-      */
-      for(int s_idx=start_col_index; s_idx<=end_col_index; s_idx++){
-        s->col.nesting[s_idx].size++;
-      }       
-    }
-    
-    if(s->col.col_index == column_watch){
-      for(int idx=0; idx< s->col.max_level[level_type::DEFINITION]; idx++){
-        printf("col_size[%d] : %d\n", idx, s->col.nesting[idx].size);
-      }
-    }    
-  }  
-}
-
-// blockDim {NTHREADS,1,1}
-extern "C" __global__ void __launch_bounds__(NTHREADS) gpuPreprocessNestingData(
-  PageInfo *pages, ColumnChunkDesc *chunks, size_t min_row, size_t num_rows, int32_t num_chunks)
-{  
-  __shared__ __align__(16) page_state_s state_g;
-
-  page_state_s *const s = &state_g;
-  int page_idx          = blockIdx.x;   
-  int t                 = threadIdx.x;
-  int out_thread0;
-
-  if(!setupLocalPageInfo(s, pages, chunks, min_row, num_rows, num_chunks)){    
-    return;
-  }
-
-  if (s->dict_base) {
-    out_thread0 = (s->dict_bits > 0) ? 64 : 32;
-  } else {
-    out_thread0 =
-      ((s->col.data_type & 7) == BOOLEAN || (s->col.data_type & 7) == BYTE_ARRAY) ? 64 : 32;
-  }
-  
-  while (!s->error && (s->value_count < s->num_values)) {
-    int target_pos;
-    int out_pos = s->out_pos;
-    
-    target_pos = min(out_pos + 2 * (NTHREADS - out_thread0), s->nz_count + (NTHREADS - out_thread0));
-    __syncthreads();
-
-    if (t < 32) {
-      // decode repetition and definition levels      
-      gpuDecodeLevels(s->rep, s, target_pos, t, level_type::REPETITION);
-      int value_count, coded_count, batch_coded_count;
-      thrust::tie(value_count, coded_count, batch_coded_count) = gpuDecodeLevels(s->def, s, target_pos, t, level_type::DEFINITION); 
-
-      // transform repetition and definition levels into final row sizes
-      gpuComputeColumnSizes(s, batch_coded_count, t);
-    } 
-    __syncthreads();
-  }  
-  __syncthreads();    
-}
-
-// now we have to transform that into actual row size information
-static __device__ void gpuComputeValidityAndRowIndices(uint32_t *rep, uint32_t *def, int batch_coded_count, int coded_count, int start_pos, page_state_s *s, int t)
+static __device__ void gpuComputeValidityOffsetsAndRowIndices(uint32_t *rep, uint32_t *def, int batch_coded_count, page_state_s *s, int t, int page_idx, int count)
 {    
   // TODO : make this actually parallel
   if(!t){
-    // these will need to be scaled by nesting depth
-    int index_count[64] = {0, 0, 0, 0};
-    int valid_index[64] = {0, 0, 0, 0};
-    //int valids[6][64];
-    int value_count = 0;
-    // int nzs[64];
-
-    /*    
-    for(int idx=0; idx<4; idx++){
-      for(int s_idx=0; s_idx<64; s_idx++){
-        valid[idx][s_idx] = 9;
-      }
-    } 
-    */
-
     int value_col_index = s->col.max_level[level_type::REPETITION];
-    printf("BCC : %d %d %d\n", batch_coded_count, coded_count, start_pos);
-    for(int idx=0; idx<batch_coded_count; idx++){ 
-      int r = s->rep[idx];
-      int d = s->def[idx];
-      int start_col_index = r;
+    int value_count = s->value_count[value_col_index];
+    if(s->col.col_index == column_watch){
+      printf("OFFSETS/INDICES : %d %d %d %d, (%d / %d)\n", page_idx, s->col.col_index, count, batch_coded_count, s->page_value_count, s->num_values);
+    }
+
+    // index of the field that stores the actual leaf values we're generating indices for    
+    for(int idx=0; idx<batch_coded_count; idx++){
+      int index = rolling_index(s->page_value_count + idx);
+      int r = s->rep[index];
+      int d = s->def[index];
+      if(s->col.col_index == column_watch){
+        printf("R / D : %d %d %d %lu\n", r, d, index, (uint64_t)s->col.nesting);
+      }
+      int start_col_index = r; 
       int end_col_index = s->col.nesting[d].remap & (~REPEATED_FIELD_BIT);
+      bool is_repeated = (s->col.nesting[d].remap & REPEATED_FIELD_BIT);
+      
       // if the field at this definition level is "repeated" it implies the element we
       // are adding is NULL. so the max_valid_index is the level before us.
       // if the definition level is 0, everything is null
-      int max_valid_index = d == 0 ? -1 : (s->col.nesting[d].remap & REPEATED_FIELD_BIT) ? end_col_index-1 : end_col_index;
-      
-      // generate validity and offsets       
-      for(int s_idx=start_col_index; s_idx<=end_col_index; s_idx++){       
+      int max_valid_index = d == 0 ? -1 : is_repeated ? end_col_index-1 : end_col_index;
+
+      // generate validity and offsets
+      for(int s_idx=start_col_index; s_idx<=end_col_index; s_idx++){
+        // count rows we've visited
+        if(s_idx == 0){
+          s->page_row_count++;
+        }
+
+        /*
+        int32_t row_index = (s->page_row_count - s->first_row) - 1;
+
+        // if we've processed the rows we care about, we're done
+        if(row_index >= s->num_rows){
+          // return;
+          goto done;
+        }
+        */
+
         // validity/row-indices
         if(s_idx <= max_valid_index){
-          cudf::set_bit_unsafe(s->valid_map[s_idx], valid_index[s_idx]); 
+          cudf::set_bit_unsafe(s->valid_map[s_idx], s->valid_count[s_idx]); 
           
           if(s_idx == value_col_index){            
-            s->nz_idx[(s->nz_count++) & (NZ_BFRSZ - 1)] = value_count;
+            s->nz_idx[rolling_index(s->nz_count++)] = value_count;
           }
         } else {
-          cudf::clear_bit_unsafe(s->valid_map[s_idx], valid_index[s_idx]);
+          cudf::clear_bit_unsafe(s->valid_map[s_idx], s->valid_count[s_idx]);
           s->col.nesting[s_idx].null_count++;
         }
         if(s_idx == value_col_index){
           value_count++;
         }
-        valid_index[s_idx]++;
+        s->valid_count[s_idx]++;
       
-        // offsets        
-        (reinterpret_cast<int**>(s->data_out))[s_idx][index_count[s_idx]] = index_count[s_idx+1];         
-        index_count[s_idx]++;
+        // offsets
+        if(s_idx != value_col_index){
+          (reinterpret_cast<int**>(s->data_out))[s_idx][s->value_count[s_idx]] = s->value_count[s_idx+1];
+        }
+        s->value_count[s_idx]++;
       }
     }
 
+done:
     if(batch_coded_count > 0){
       // final offset value.
-      if(s->col.col_index == column_watch){
-        //printf("end_col_index : %d %s\n", end_col_index);
-      }
       for(int s_idx=0; s_idx<=s->col.max_level[level_type::REPETITION]; s_idx++){      
-        (reinterpret_cast<int**>(s->data_out))[s_idx][index_count[s_idx]] = index_count[s_idx+1];   
+         if(s_idx != value_col_index){
+          (reinterpret_cast<int**>(s->data_out))[s_idx][s->value_count[s_idx]] = s->value_count[s_idx+1];   
+         }
       }
-
+      
       if(s->col.col_index == column_watch){
         for(int idx=0; idx<=s->col.max_level[level_type::REPETITION]; idx++){
           printf("null_count[%d] %d\n", idx, s->col.nesting[idx].null_count);
@@ -1314,7 +1436,7 @@ static __device__ void gpuComputeValidityAndRowIndices(uint32_t *rep, uint32_t *
           printf("%d, ", s->nz_idx[idx]);
         }
         printf("\n");
-      }    
+      }
     }    
   }    
 }
@@ -1342,11 +1464,15 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
   page_state_s *const s = &state_g;
   int page_idx          = blockIdx.x;
   int t                 = threadIdx.x;
-  int out_thread0;  
+  int out_thread0;    
   
-  if(!setupLocalPageInfo(s, pages, chunks, min_row, num_rows, num_chunks)){
+  if(!setupDecodeLocalPageInfo(s, pages, chunks, min_row, num_rows, num_chunks)){
     return;
   }    
+
+  if(!t){
+    printf("DATAAAA\n");
+  }
   
   if (s->dict_base) {
     out_thread0 = (s->dict_bits > 0) ? 64 : 32;
@@ -1356,7 +1482,10 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
   }  
 
   int loop = 0;
-  while (!s->error && (s->value_count < s->num_values || s->out_pos < s->nz_count)) {
+  while (!s->error && (s->page_value_count < s->num_values || s->out_pos < s->nz_count)) {
+    //if(!t){
+      //printf("LOOP : %d %d\n", page_idx, s->out_pos, loop++);
+    //}
     int target_pos;
     int out_pos = s->out_pos;
 
@@ -1369,14 +1498,25 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
     }
     __syncthreads();
     if (t < 32) {
-      // WARP0: Decode definition and repetition levels, outputs row indices
-      int start_pos = s->nz_count;
-      int value_count, coded_count, batch_coded_count;
-      if(has_nesting){
-        gpuDecodeLevels(s->rep, s, target_pos, t, level_type::REPETITION);
+      // WARP0: Decode definition and repetition levels, outputs:
+      // - validity for all nested columns
+      // - offsets for all nested columns
+      // - row indices for leaf column value decoding
+      if(t == 0 && s->col.col_index == column_watch){
+        printf("Decode P : %d\n", target_pos);
       }
-      thrust::tie(value_count, coded_count, batch_coded_count) = gpuDecodeLevels(s->def, s, target_pos, t, level_type::DEFINITION);
-      gpuComputeValidityAndRowIndices(s->rep, s->def, batch_coded_count, coded_count, start_pos, s, t);
+      gpuDecodeLevels(s->rep, s, target_pos, t, level_type::REPETITION);
+      int batch_coded_count = gpuDecodeLevels(s->def, s, target_pos, t, level_type::DEFINITION);
+
+      __syncthreads();
+
+      gpuComputeValidityOffsetsAndRowIndices(s->rep, s->def, batch_coded_count, s, t, page_idx, loop);
+
+      __syncthreads();
+
+      if(!t){        
+        s->page_value_count += batch_coded_count;
+      }
     } else if (t < out_thread0) {
       // WARP1: Decode dictionary indices, booleans or string positions
       if (s->dict_base) {
@@ -1391,16 +1531,17 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
       // WARP1..WARP3: Decode values
       int dtype = s->col.data_type & 7;
       out_pos += t - out_thread0;
-      int value_idx = s->nz_idx[out_pos & (NZ_BFRSZ - 1)];
+      int value_idx = s->nz_idx[rolling_index(out_pos)];
 
-      int value_level_index = s->col.max_level[level_type::REPETITION];
-      //printf("VLL : %d\n", value_level_index);
-      
+      // nesting level that is storing actual leaf values
+      int value_level_index = s->col.max_level[level_type::REPETITION];      
+            
+      //printf("VALD : %d, %d, %d, %d, %d\n", out_pos, target_pos, value_idx, s->first_value, s->num_values);
       if (out_pos < target_pos && value_idx >= 0 && s->first_value + value_idx < s->num_values) {
-        uint32_t dtype_len = s->dtype_len;        
+        uint32_t dtype_len = s->dtype_len;                
         uint8_t *dst       = s->data_out[value_level_index] + (size_t)value_idx * dtype_len;        
         if (dtype == BYTE_ARRAY)
-          gpuOutputString(s, out_pos, dst);
+          gpuOutputString(s, out_pos, dst, value_idx);
         else if (dtype == BOOLEAN)
           gpuOutputBoolean(s, out_pos, dst);
         else if (s->col.converted_type == DECIMAL)
@@ -1417,9 +1558,20 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
         else
           gpuOutputGeneric(s, out_pos, dst, dtype_len);
       }
-      if (t == out_thread0) { *(volatile int32_t *)&s->out_pos = target_pos; }
+      
+      if (t == out_thread0) { *(volatile int32_t *)&s->out_pos = target_pos; }      
     }
+    loop++;
     __syncthreads();
+
+    if(!t && s->col.col_index == column_watch){
+      printf("Status at end of loop :\n");
+      for(int idx=0; idx<20; idx++){
+        int value_level_index = s->col.max_level[level_type::REPETITION];
+        nvstrdesc_s *dst = &((nvstrdesc_s*)(s->data_out[value_level_index]))[idx];
+        printf("   STR : %d %lu\n", idx, (uint64_t)dst->ptr);
+      }
+    }
   }
   __syncthreads();
   if (!t) {
@@ -1427,16 +1579,58 @@ extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
     // valid values
    
     // ROW VALUE
-    pages[page_idx].num_rows    = s->_num_rows - s->_first_row;    
+    //pages[page_idx].num_rows    = s->num_rows - s->first_row;    
 
-    printf("END NULLS : %d %d\n", s->col.nesting[0].null_count, s->col.nesting[1].null_count);
+    //printf("END NULLS : %d %d\n", s->col.nesting[0].null_count, s->col.nesting[1].null_count);
     // pages[page_idx].num_values = s->num_values - s->first_value;    
 
     // pages[page_idx].valid_count = (s->error) ? -s->error : s->page.valid_count;
+
+    if(s->col.col_index == column_watch){
+      printf("DONE DECODING VALIDS\n");
+      for(int idx=0; idx<=s->col.max_level[level_type::REPETITION]; idx++){
+        printf("null_count[%d] %d\n", idx, s->col.nesting[idx].null_count);
+        printf("valids[%d] ", idx);
+        for(int s_idx=0; s_idx<s->col.nesting[idx].size; s_idx++){
+          printf("%d", bit_is_set(s->valid_map[idx], s_idx) ? 1 : 0);
+        }
+        printf("\n");          
+      }
+
+      for(int idx=0; idx<20; idx++){
+        int value_level_index = s->col.max_level[level_type::REPETITION];
+        nvstrdesc_s *dst = &((nvstrdesc_s*)(s->data_out[value_level_index]))[idx];
+        printf("STR : %d %lu\n", idx, (uint64_t)dst->ptr);
+      }
+    }
   }
 }
 
-cudaError_t __host__ PreprocessNestingData(PageInfo *pages,
+// this seems generally useful.  couldn't hurt to see if there's a way to genericize this
+// as a general output-to-a-specific-field iterator
+struct chunk_row_output_iter {
+  PageInfo *p;
+  using value_type = size_type;
+  using difference_type = size_type;
+  using pointer = size_type*;
+  using reference = size_type&;
+  using iterator_category = thrust::output_device_iterator_tag;   
+  
+  chunk_row_output_iter operator+ __host__ __device__ (int i){ return chunk_row_output_iter{p + i}; }
+  chunk_row_output_iter operator[] __host__ __device__ (int i){ return chunk_row_output_iter{p + i}; }  
+  void operator++ __host__ __device__ () { p++; }  
+  reference operator* __host__ __device__ () { return p->chunk_row; }  
+  void operator= __host__ __device__ (value_type v) { p->chunk_row = v; }
+};
+
+// Some values we need to decode the data are not readily available after the header decoding
+// step, so we have to do some preprocessing.
+// This step computes :
+// - # of rows per page (PageInfo::num_rows). This cannot be trivially inferred from # of values
+//   when dealing with nested types
+// - starting row per page (PageInfo::chunk_row)
+// - size of all columns, including nesting (ColumnChunkDesc::nesting)
+cudaError_t __host__ PreprocessColumnData(PageInfo *pages,
                                     int32_t num_pages,
                                     ColumnChunkDesc *chunks,
                                     int32_t num_chunks,
@@ -1446,8 +1640,32 @@ cudaError_t __host__ PreprocessNestingData(PageInfo *pages,
 {
   dim3 dim_block(NTHREADS, 1);
   dim3 dim_grid(num_pages, 1);  // 1 threadblock per page    
-  gpuPreprocessNestingData<<<dim_grid, dim_block, 0, stream>>>(
-    pages, chunks, min_row, num_rows, num_chunks);
+  
+  // computes:
+  // PageInfo::num_rows for all pages
+  gpuComputeRowCounts<<<dim_grid, dim_block, 0, stream>>>(
+    pages, chunks, num_chunks);
+
+  // computes:
+  // PageInfo::chunk_row for all pages    
+  auto key_input = thrust::make_transform_iterator(pages, [] __device__ (PageInfo const& page){
+    return page.chunk_idx;
+  });     
+  auto page_input = thrust::make_transform_iterator(pages, [] __device__ (PageInfo const& page){
+    return page.num_rows;
+  });
+  // !!! This is making the assumption that ordering of pages is sorted by chunk_idx !!!
+  thrust::exclusive_scan_by_key(rmm::exec_policy(stream)->on(stream),
+                                key_input,
+                                key_input + num_pages,
+                                page_input,
+                                chunk_row_output_iter{pages});
+
+  // computes:
+  // buffer sizes for all outgoing columns  
+  gpuComputeColumnSizes<<<dim_grid, dim_block, 0, stream>>>(
+    pages, chunks, min_row, num_rows, num_chunks);    
+
   return cudaSuccess;
 }
 
@@ -1461,140 +1679,10 @@ cudaError_t __host__ DecodePageData(PageInfo *pages,
                                     cudaStream_t stream)
 {
   dim3 dim_block(NTHREADS, 1);
-  dim3 dim_grid(num_pages, 1);  // 1 threadblock per page
+  dim3 dim_grid(num_pages, 1);  // 1 threadblock per page    
+
   gpuDecodePageData<<<dim_grid, dim_block, 0, stream>>>(
     pages, chunks, min_row, num_rows, num_chunks, has_nesting);
-  return cudaSuccess;
-}
-
-
-#if 0
-// REFERENCE
-/**
- * @brief Kernel for reading the column data stored in the pages
- *
- * This function will write the page data and the page data's validity to the
- * output specified in the page's column chunk. If necessary, additional
- * conversion will be performed to translate from the Parquet datatype to
- * desired output datatype (ex. 32-bit to 16-bit, string to hash).
- *
- * @param[in] pages List of pages
- * @param[in,out] chunks List of column chunks
- * @param[in] min_row crop all rows below min_row
- * @param[in] num_rows Maximum number of rows to read
- * @param[in] num_chunks Number of column chunks
- **/
-// blockDim {NTHREADS,1,1}
-extern "C" __global__ void __launch_bounds__(NTHREADS) gpuDecodePageData(
-  PageInfo *pages, ColumnChunkDesc *chunks, size_t min_row, size_t num_rows, int32_t num_chunks)
-{
-  __shared__ __align__(16) page_state_s state_g;  
-
-  page_state_s * s = &state_g;
-  int page_idx          = blockIdx.x;
-  int t                 = threadIdx.x;
-  int out_thread0;  
-    
-  if(!setupLocalPageInfo(s, pages, chunks, min_row, num_rows, num_chunks)){
-    return;
-  }
-    
-  if (s->dict_base) {
-    out_thread0 = (s->dict_bits > 0) ? 64 : 32;
-  } else {
-    out_thread0 =
-      ((s->col.data_type & 7) == BOOLEAN || (s->col.data_type & 7) == BYTE_ARRAY) ? 64 : 32;
-  }
-
-  while (!s->error && (s->value_count < s->num_values || s->out_pos < s->nz_count)) {
-    int target_pos;
-    int out_pos = s->out_pos;
-
-    if (t < out_thread0) {
-      target_pos =
-        min(out_pos + 2 * (NTHREADS - out_thread0), s->nz_count + (NTHREADS - out_thread0));
-    } else {
-      target_pos = min(s->nz_count, out_pos + NTHREADS - out_thread0);
-      if (out_thread0 > 32) { target_pos = min(target_pos, s->dict_pos); }
-    }
-    __syncthreads();
-    if (t < 32) {
-      // WARP0: Decode definition and repetition levels, outputs row indices
-      gpuDecodeLevels(s, target_pos, t, level_type::DEFINITION);
-    } else if (t < out_thread0) {
-      // WARP1: Decode dictionary indices, booleans or string positions
-      if (s->dict_base) {
-        target_pos = gpuDecodeDictionaryIndices(s, target_pos, t & 0x1f);
-      } else if ((s->col.data_type & 7) == BOOLEAN) {
-        target_pos = gpuDecodeRleBooleans(s, target_pos, t & 0x1f);
-      } else if ((s->col.data_type & 7) == BYTE_ARRAY) {
-        gpuInitStringDescriptors(s, target_pos, t & 0x1f);
-      }
-      if (t == 32) { *(volatile int32_t *)&s->dict_pos = target_pos; }
-    } else {
-      // WARP1..WARP3: Decode values
-      int dtype = s->col.data_type & 7;
-      out_pos += t - out_thread0;
-      int row_idx = s->nz_idx[out_pos & (NZ_BFRSZ - 1)];
-      if (out_pos < target_pos && row_idx >= 0 && s->_first_row + row_idx < s->_num_rows) {
-        uint32_t dtype_len = s->dtype_len;
-        uint8_t *dst       = s->data_out + (size_t)row_idx * dtype_len;
-        if (dtype == BYTE_ARRAY)
-          gpuOutputString(s, out_pos, dst);
-        else if (dtype == BOOLEAN)
-          gpuOutputBoolean(s, out_pos, dst);
-        else if (s->col.converted_type == DECIMAL)
-          gpuOutputDecimal(s, out_pos, reinterpret_cast<double *>(dst), dtype);
-        else if (dtype == INT96)
-          gpuOutputInt96Timestamp(s, out_pos, reinterpret_cast<int64_t *>(dst));
-        else if (dtype_len == 8) {
-          if (s->ts_scale)
-            gpuOutputInt64Timestamp(s, out_pos, reinterpret_cast<int64_t *>(dst));
-          else
-            gpuOutputFast(s, out_pos, reinterpret_cast<uint2 *>(dst));
-        } else if (dtype_len == 4)
-          gpuOutputFast(s, out_pos, reinterpret_cast<uint32_t *>(dst));
-        else
-          gpuOutputGeneric(s, out_pos, dst, dtype_len);
-      }
-      if (t == out_thread0) { *(volatile int32_t *)&s->out_pos = target_pos; }
-    }
-    __syncthreads();
-  }
-  __syncthreads();
-  if (!t) {
-    // Update the number of rows (after cropping to [min_row, min_row+num_rows-1]), and number of
-    // valid values
-    pages[page_idx].num_rows    = s->_num_rows - s->_first_row;
-    pages[page_idx].valid_count = (s->error) ? -s->error : s->page.valid_count;
-  }
-}
-
-cudaError_t __host__ PreprocessPageData(PageInfo *pages,
-                                    int32_t num_pages,
-                                    ColumnChunkDesc *chunks,
-                                    int32_t num_chunks,
-                                    size_t num_rows,
-                                    size_t min_row,
-                                    bool has_nesting,
-                                    cudaStream_t stream)
-{
-  return cudaSuccess;
-}
-
-cudaError_t __host__ DecodePageData(PageInfo *pages,
-                                    int32_t num_pages,
-                                    ColumnChunkDesc *chunks,
-                                    int32_t num_chunks,
-                                    size_t num_rows,
-                                    size_t min_row,
-                                    bool has_nesting,
-                                    cudaStream_t stream)
-{
-  dim3 dim_block(NTHREADS, 1);
-  dim3 dim_grid(num_pages, 1);  // 1 threadblock per page
-  gpuDecodePageData<<<dim_grid, dim_block, 0, stream>>>(
-    pages, chunks, min_row, num_rows, num_chunks);
   return cudaSuccess;
 }
 #endif

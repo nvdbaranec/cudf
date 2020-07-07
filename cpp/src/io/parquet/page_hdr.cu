@@ -223,6 +223,8 @@ extern "C" __global__ void __launch_bounds__(128)
       bs->base = bs->cur = bs->ck.compressed_data;
       bs->end            = bs->base + bs->ck.compressed_size;
       bs->page.chunk_idx = chunk;
+      // these values cannot be computed here in the case of nested types.
+      // the must be done by examining the repetition and definition levels at a later step.
       bs->page.chunk_row = 0;
       bs->page.num_rows  = 0;
     }
@@ -241,13 +243,9 @@ extern "C" __global__ void __launch_bounds__(128)
         if (gpuParsePageHeader(bs) && bs->page.compressed_page_size >= 0) {
           switch (bs->page_type) {
             case DATA_PAGE:
-              PRINTF("DATA_PAGE %d\n", bs->page.num_values );
-              // TODO: Unless the file only uses V2 page headers or has no complex nesting (num_rows
-              // == num_values), we can't infer num_rows at this time
-              // -> we'll need another pass after decompression to parse the definition and
-              // repetition levels to infer the correct value of num_rows
-              bs->page.num_rows = bs->page.num_values;  // Assumes num_rows == num_values
-                                                        // Fall-through to V2              
+              // this computation is only valid for non-nested types. for nested types we
+              // will have recompute this value after preprocessing repetition and definition levels
+              bs->page.num_rows = bs->page.num_values;
             case DATA_PAGE_V2:
               PRINTF("DATA_PAGE_V2\n");
               index_out = num_dict_pages + data_page_count;

@@ -48,6 +48,7 @@ std::unique_ptr<column> make_strings_column(
     thrust::make_counting_iterator<size_t>(strings_count),
     [d_strings] __device__(size_t idx) {
       auto item = d_strings[idx];
+      printf("INDEX : %d %lu\n", idx, (uint64_t)item.first);
       return (item.first != nullptr) ? item.second : 0;
     },
     0,

@@ -156,6 +156,7 @@ class reader::impl {
                         size_t total_rows,
                         const std::vector<int> &chunk_map,
                          std::vector<column_buffer>& out_buffers,
+                        bool has_nesting,
                         cudaStream_t stream);
 
  private:

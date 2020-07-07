@@ -62,11 +62,19 @@ struct PageInfo {
   int32_t num_rows;                // number of rows in this page
   int32_t chunk_idx;               // column chunk this page belongs to
   uint8_t flags;                   // PAGEINFO_FLAGS_XXX
-  uint8_t encoding;                // Encoding for data or dictionary page
+  uint8_t encoding;                   // Encoding for data or dictionary page
   uint8_t definition_level_encoding;  // Encoding used for definition levels (data page)
   uint8_t repetition_level_encoding;  // Encoding used for repetition levels (data page)
-  int32_t _valid_count;  // Count of valid (non-null) values in this page (negative values indicate
-                        // data error)
+};
+
+// bit indicating (in the col_remap field) if this remap level indicates a repeated field
+constexpr int32_t REPEATED_FIELD_BIT = (1<<31);
+
+// information about each level of nesting within the column.
+struct ColumnNestingInfo {
+  int32_t         remap;
+  int32_t         size;
+  int32_t         null_count;
 };
 
 // bit indicating (in the col_remap field) if this remap level indicates a repeated field
@@ -106,8 +114,7 @@ struct ColumnChunkDesc {
       compressed_size(compressed_size_),
       num_values(num_values_),
       start_row(start_row_),
-      num_row_group_rows(num_row_group_rows_),
-      num_rows{0},
+      num_rows(num_rows_),
       max_level{max_definition_level_, max_repetition_level_},
       data_type(datatype_ | (datatype_length_ << 3)),
       level_bits{def_level_bits_, rep_level_bits_},
@@ -131,8 +138,7 @@ struct ColumnChunkDesc {
   size_t compressed_size;       // total compressed data size for this chunk
   size_t num_values;            // total number of values in this column
   size_t start_row;             // starting row of this chunk
-  uint32_t num_row_group_rows;  // total number of top level rows in this chunk
-  uint32_t num_rows[16];        // number of rows, per definition (nesting) level in this chunk
+  uint32_t num_rows;            // total number of top level rows in this chunk
   int16_t max_level[level_type::NUM_LEVEL_TYPES]; // max definition/repetition level
   uint16_t data_type;           // basic column data type, ((type_length << 3) |
                                 // parquet::Type)
@@ -263,7 +269,7 @@ cudaError_t BuildStringDictionaryIndex(ColumnChunkDesc *chunks,
                                        int32_t num_chunks,
                                        cudaStream_t stream = (cudaStream_t)0);
 
-cudaError_t PreprocessNestingData(PageInfo *pages,
+cudaError_t PreprocessColumnData(PageInfo *pages,
                            int32_t num_pages,
                            ColumnChunkDesc *chunks,
                            int32_t num_chunks,

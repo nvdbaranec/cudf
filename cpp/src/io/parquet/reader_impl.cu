@@ -206,11 +206,13 @@ struct metadata : public FileMetaData {
     for (size_t i = 1; i < path_in_schema.size(); i++) { s += "." + path_in_schema[i]; }
     return s;
   }
-    
+  
+  /*
   std::string get_column_name(int schema_idx)
   {    
     return schema[schema_idx].name;
-  }  
+  }
+  */
 
   std::vector<std::string> get_column_names()
   {
@@ -576,8 +578,8 @@ void reader::impl::preprocess_nested_columns(hostdevice_vector<gpu::ColumnChunkD
   // for nested columns, the # of rows in the metadata is not sufficient to determine
   // the size of the outgoing columns.  we need to parse the repetition and definition
   // levels to determine this
-  printf("PREPROCESS START\n");
-  CUDA_TRY(gpu::PreprocessNestingData(pages.device_ptr(),
+  printf("PREPROCESS START %lu, %lu\n", min_row, total_rows);
+  CUDA_TRY(gpu::PreprocessColumnData(pages.device_ptr(),
                                 pages.size(),
                                 chunks.device_ptr(),
                                 chunks.size(),
@@ -595,6 +597,7 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc> &chu
                                     size_t total_rows,
                                     const std::vector<int> &chunk_map,
                                     std::vector<column_buffer> &out_buffers,
+                                    bool has_nesting,
                                     cudaStream_t stream)
 {  
   printf("DECODE START\n");
@@ -624,7 +627,7 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc> &chu
     }
 
     int output_depth = chunks[c].max_level[gpu::level_type::REPETITION];    
-    printf("OD : %d\n", output_depth);
+    // printf("OD : %d\n", output_depth);
     
     // setup base pointers. need to do this better
     size_type buf_bytes = sizeof(void*) * (output_depth+1);
@@ -637,13 +640,13 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc> &chu
       data[idx] = buf->data();             
       valids[idx] = buf->null_mask();
       if(idx < output_depth){
-        printf("BPI : %d\n", idx);
+        //printf("BPI : %d\n", idx);
         CUDF_EXPECTS(buf->children.size() > 0, "Encountered a malformed column_buffer");
         buf = &buf->children[0];
       }
     }
-    printf("H %lu %lu\n", (uint64_t)valids[0], (uint64_t)data[0]);
-    printf("H %lu %lu\n", (uint64_t)valids[1], (uint64_t)data[1]);
+    //printf("H %lu %lu\n", (uint64_t)valids[0], (uint64_t)data[0]);
+    //printf("H %lu %lu\n", (uint64_t)valids[1], (uint64_t)data[1]);
     cudaMemcpy(chunks[c].valid_map_base, valids.data(), buf_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(chunks[c].column_data_base, data.data(), buf_bytes, cudaMemcpyHostToDevice);
 
@@ -655,7 +658,7 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc> &chu
   CUDA_TRY(cudaMemcpyAsync(
     chunks.device_ptr(), chunks.host_ptr(), chunks.memory_size(), cudaMemcpyHostToDevice, stream));
   if (total_str_dict_indexes > 0) {
-    //CUDA_TRY(gpu::BuildStringDictionaryIndex(chunks.device_ptr(), chunks.size(), stream));
+    CUDA_TRY(gpu::BuildStringDictionaryIndex(chunks.device_ptr(), chunks.size(), stream));
   }  
 
   printf("DecodePageData : pages size : %lu, chunks size : %lu, total rows : %lu, min row : %lu\n",
@@ -666,23 +669,11 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc> &chu
                                chunks.size(),
                                total_rows,
                                min_row,
+                               has_nesting,
                                stream));
   CUDA_TRY(cudaMemcpyAsync(
     pages.host_ptr(), pages.device_ptr(), pages.memory_size(), cudaMemcpyDeviceToHost, stream));
   CUDA_TRY(cudaStreamSynchronize(stream));
-
-  // ROW VALUE
-  /*
-  for (size_t i = 0; i < pages.size(); i++) {
-    if (pages[i].num_rows > 0) {
-      const size_t c = pages[i].chunk_idx;
-      if (c < chunks.size()) {
-        // TODO
-        // out_buffers[chunk_map[c]].null_count() += pages[i].num_rows - pages[i].valid_count;
-      }
-    }
-  }
-  */
 
   printf("DECODE END\n");
 }
@@ -776,6 +767,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
       col_nullability[col.first] = std::move(std::vector<bool>(output_depth));
       
       // for non-nested columns, just set nullability
+      /*
       if(leaf_schema.max_repetition_level == 0){
         // i'm not sure this is exactly correct, but it's how we we've been doing it so far.
         // seems like we should be checking the repetition type (required / optional)
@@ -785,7 +777,9 @@ table_with_metadata reader::impl::read(size_type skip_rows,
       // - allocate output space for computing column sizes (which will be done on the gpu)
       // - build mapping of schema definition levels to real cudf child column output indices
       // - fill in nullability
-      else {
+      else 
+      */
+      {
         size_t size = output_depth + (leaf_schema.max_definition_level + 1);
         printf("calloc size : %lu, %lu\n", size, nested_column_info.size());        
         nested_column_info[col.first] = std::move(hostdevice_vector<gpu::ColumnNestingInfo>(size, size, stream));
@@ -894,6 +888,14 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         printf("Leaf type : %d %d\n", leaf_schema.type, leaf_schema.converted_type);
         printf("R / V : %d, %d\n", static_cast<int>(row_group.num_rows), static_cast<int>(col_meta.num_values));
 
+        bool is_nested = cudf::is_nested(column_types[i]);
+        /*
+        printf("NESTED : %s\n", is_nested ? "yes" : "no");
+        printf("Root type : %d %d\n", root_schema.type, root_schema.converted_type);
+        printf("Leaf type : %d %d\n", leaf_schema.type, leaf_schema.converted_type);
+        printf("R / V : %d, %d\n", static_cast<int>(row_group.num_rows), static_cast<int>(col_meta.num_values));
+        */
+
         chunks.insert(gpu::ColumnChunkDesc(col_meta.total_compressed_size,
                                            nullptr,
                                            col_meta.num_values,
@@ -910,7 +912,8 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                                            leaf_schema.decimal_scale,
                                            clock_rate,
                                            i,
-                                           is_nested ? nested_column_info[i].device_ptr() : nullptr));
+                                           nested_column_info[i].device_ptr()));
+                                           // is_nested ? nested_column_info[i].device_ptr() : nullptr));
 
         // Map each column chunk to its column index
         chunk_map[chunks.size() - 1] = i;
@@ -991,7 +994,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
       }
 
       // decoding of column data itself      
-      decode_page_data(chunks, pages, skip_rows, num_rows, chunk_map, out_buffers, stream);
+      decode_page_data(chunks, pages, skip_rows, num_rows, chunk_map, out_buffers, has_nesting, stream);
             
       for (size_t i = 0; i < column_types.size(); ++i) {        
         // retrieve validity counts
@@ -1001,30 +1004,34 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         auto &leaf_schema = _metadata->get_column_leaf_schema(col.first);
 
         int output_depth = leaf_schema.max_repetition_level + 1;
-                
+                        
         uint8_t buf[512];
         column_buffer* cb = &out_buffers[i];
         for(int idx=0; idx<output_depth-1; idx++){          
           cb->_null_count = nested_column_info[i][idx].null_count;
+          /*
           cudaMemcpy(buf, cb->data(), cb->size * 4, cudaMemcpyDeviceToHost);
           printf("offsets, depth %d : \n", idx);
           for(int s_idx=0; s_idx<cb->size; s_idx++){
             printf("%d, ", ((int*)buf)[s_idx]);
           }
           printf("\n");          
+          */
           cb = &cb->children[0];
         }
         {
           cb->_null_count = nested_column_info[i][output_depth-1].null_count;
+          /*
           cudaMemcpy(buf, cb->data(), cb->size * 4, cudaMemcpyDeviceToHost);
           printf("vals, depth %d : \n", output_depth-1);
           for(int s_idx=0; s_idx<cb->size; s_idx++){
             printf("%d, ", ((int*)buf)[s_idx]);
           }
           printf("\n");
+          */
         }         
         
-        printf("OBE : %d %d\n", out_buffers[0].type.id(), out_buffers[0].children[0].type.id());
+        // printf("OBE : %d %d\n", out_buffers[0].type.id(), out_buffers[0].children[0].type.id());
         out_columns.emplace_back(make_column(out_buffers[i], stream, _mr));
       }      
     }
