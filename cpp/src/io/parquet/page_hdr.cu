@@ -226,6 +226,7 @@ extern "C" __global__ void __launch_bounds__(128)
       // these values cannot be computed here in the case of nested types.
       // the must be done by examining the repetition and definition levels at a later step.
       bs->page.chunk_row = 0;
+      bs->page.chunk_value = 0;
       bs->page.num_rows  = 0;
     }
     num_values     = bs->ck.num_values;
@@ -238,7 +239,10 @@ extern "C" __global__ void __launch_bounds__(128)
       int index_out = -1;
 
       if (t == 0) {
+        // again, this only works for non-nested types, where num_rows == num_values.
+        // these values will be recomputed at a later step for files containing nested types
         bs->page.chunk_row += bs->page.num_rows;
+        bs->page.chunk_value += bs->page.num_rows;
         bs->page.num_rows = 0;
         if (gpuParsePageHeader(bs) && bs->page.compressed_page_size >= 0) {
           switch (bs->page_type) {

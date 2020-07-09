@@ -59,6 +59,7 @@ struct PageInfo {
   int32_t uncompressed_page_size;  // uncompressed data size in bytes
   int32_t num_values;              // Number of values in this data page or dictionary
   int32_t chunk_row;               // starting row of this page relative to the start of the chunk
+  int32_t chunk_value;             // starting value of this page relative to the start of the chunk
   int32_t num_rows;                // number of rows in this page
   int32_t chunk_idx;               // column chunk this page belongs to
   uint8_t flags;                   // PAGEINFO_FLAGS_XXX
@@ -67,24 +68,33 @@ struct PageInfo {
   uint8_t repetition_level_encoding;  // Encoding used for repetition levels (data page)
 };
 
-// bit indicating (in the col_remap field) if this remap level indicates a repeated field
-constexpr int32_t REPEATED_FIELD_BIT = (1<<31);
-
 // information about each level of nesting within the column.
+// IMPORTANT : we access this data in a strange way.
+// - the INPUT data is stored by definition level.  so during decoding we can
+//   read repetition_type and remap by indexing directly by the definition levels in the data
+//
+// - the OUTPUT data is stored by output column index.
+//
+// so if we had the following array
+// 
+// ColumnNestingInfo *nesting;
+//
+// int input_index = read_from_definition_level_data();
+// int output_index = nesting[input_index].remap
+// nesting[output_index].size++;
+//
+// this is perhaps overly sneaky, but it allows us to get away with a single array of 
+// nesting info rather than needing two seperate ones.
+//
 struct ColumnNestingInfo {
-  int32_t         remap;
-  int32_t         size;
-  int32_t         null_count;
-};
+  // indexed by definition level
+  int32_t             d_remap;
 
-// bit indicating (in the col_remap field) if this remap level indicates a repeated field
-constexpr int32_t REPEATED_FIELD_BIT = (1<<31);
-
-// information about each level of nesting within the column.
-struct ColumnNestingInfo {
-  int32_t         remap;
-  int32_t         size;
-  int32_t         null_count;
+  // indexed by output column index
+  int32_t             o_max_def_level;
+  int32_t             o_size;
+  int32_t             o_null_count;
+  bool                o_nullable;
 };
 
 /**
@@ -156,7 +166,7 @@ struct ColumnChunkDesc {
   int8_t decimal_scale;         // decimal scale pow(10, -decimal_scale)
   int32_t ts_clock_rate;        // output timestamp clock frequency (0=default, 1000=ms, 1000000000=ns)  
   
-  int32_t col_index;            // debug  
+  int32_t col_index;            // debug
   ColumnNestingInfo *nesting;
 };
 

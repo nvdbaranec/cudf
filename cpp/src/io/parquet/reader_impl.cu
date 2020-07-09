@@ -199,6 +199,28 @@ struct metadata : public FileMetaData {
   {
     return schema[get_column_leaf_schema_index(col_index)];
   }
+
+  inline int get_nesting_depth(int col_index)
+  {
+    // this is not strictly correct.  parquet supports repeated fields for non-lists. 
+    // we are making the assumption that repeated fields here indicate lists, specifically.
+    // this will need to be adjusted for struct support
+    // see : the "Nested Types" section here 
+    // https://github.com/apache/parquet-format/blob/master/LogicalTypes.md
+
+    int index = get_column_leaf_schema_index(col_index);
+    int depth = 0;
+
+    // walk upwards, skipping repeated fields
+    while(index > 0){
+      if(schema[index].repetition_type != REPEATED){
+        depth++;
+      }
+      index = schema[index].parent_idx;
+    }
+
+    return depth;
+  }
   
   std::string get_column_name(const std::vector<std::string> &path_in_schema)
   {
@@ -740,92 +762,68 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     // Keep track of column chunk file offsets
     std::vector<size_t> column_chunk_offsets(num_chunks);
 
-    // column nullability
-    std::vector<std::vector<bool>> col_nullability(column_types.size());
-
     // information needed allocate columns (including potential nesting)
     bool has_nesting = false;
-    /*
-    std::vector<size_type*> g_col_sizes_nested(column_types.size());
-    std::vector<size_type*> h_col_sizes_nested(column_types.size());
-    std::vector<size_type*> g_col_remap_nested(column_types.size());    
-    std::vector<size_type*> h_col_remap_nested(column_types.size());
-    std::vector<size_type*> g_col_valid_count_nested(column_types.size());    
-    std::vector<size_type*> h_col_remap_nested(column_types.size());
-    */
+
     // nesting information per column
     std::vector<hostdevice_vector<gpu::ColumnNestingInfo>> nested_column_info(column_types.size()); 
     for (const auto &col : _selected_columns) {
-      // for non-nested columns, these will be the same. for lists, the leaf schema represents the bottom
-      // level type (int, string, etc).  For future types like structs, this will probably get more complicated.
-      auto &col_schema = _metadata->get_column_schema(col.first);       
-      auto &leaf_schema = _metadata->get_column_leaf_schema(col.first);       
+      // the leaf schema represents the bottom of the nested hierarchy
+      auto &leaf_schema = _metadata->get_column_leaf_schema(col.first);
 
-      // depth of the nesting in the output (1 == no nesting, 2 == 1 level, etc)
-      int output_depth = (leaf_schema.max_repetition_level + 1);
-
-      col_nullability[col.first] = std::move(std::vector<bool>(output_depth));
-      
-      // for non-nested columns, just set nullability
-      /*
-      if(leaf_schema.max_repetition_level == 0){
-        // i'm not sure this is exactly correct, but it's how we we've been doing it so far.
-        // seems like we should be checking the repetition type (required / optional)
-        col_nullability[col.first][0] = leaf_schema.max_definition_level != 0 ? true : false;        
-      } 
-      // for nested columns:
-      // - allocate output space for computing column sizes (which will be done on the gpu)
-      // - build mapping of schema definition levels to real cudf child column output indices
-      // - fill in nullability
-      else 
-      */
-      {
-        size_t size = output_depth + (leaf_schema.max_definition_level + 1);
-        printf("calloc size : %lu, %lu\n", size, nested_column_info.size());        
-        nested_column_info[col.first] = std::move(hostdevice_vector<gpu::ColumnNestingInfo>(size, size, stream));
-
-        // zero data
-        cudaMemset(nested_column_info[col.first].host_ptr(), 0, sizeof(gpu::ColumnNestingInfo) * size);
-        
-        // fill in host-side schema-remapping        
-        // printf("remap : %lu\n", (uint64_t)remap);
-        // int schema_idx = _metadata->row_groups[0].columns[col.first].schema_idx;
-        int schema_idx = _metadata->get_column_leaf_schema_index(col.first);
-        int output_col_idx = leaf_schema.max_repetition_level;
-        while(schema_idx > 0){
-          printf("Schema : %d, %d, %d, %d, %d\n", schema_idx, 
-            _metadata->schema[schema_idx].type,
-            _metadata->schema[schema_idx].repetition_type,
-            _metadata->schema[schema_idx].max_definition_level,
-            _metadata->schema[schema_idx].max_repetition_level);          
-
-          // this field is misnamed. it really should just be "definition level"
-          int d = _metadata->schema[schema_idx].max_definition_level;
-
-          // the list definition itself
-          if(_metadata->schema[schema_idx].repetition_type == REPEATED){
-            nested_column_info[col.first][d].remap = output_col_idx | cudf::io::parquet::gpu::REPEATED_FIELD_BIT;
-            output_col_idx--;            
-          }
-          // the element within 
-          else {
-            nested_column_info[col.first][d].remap = output_col_idx;
-            col_nullability[col.first][output_col_idx] = _metadata->schema[schema_idx].repetition_type == OPTIONAL ? true : false;
-          }
-          schema_idx = _metadata->schema[schema_idx].parent_idx;          
-        }
-
-        for(int s_idx=0; s_idx<=leaf_schema.max_definition_level; s_idx++){
-          printf("hcols[%d] : 0x%x\n", s_idx, nested_column_info[col.first][s_idx].remap);
-        }
-        for(int s_idx=0; s_idx<output_depth; s_idx++){
-          printf("nullable[%d] : %s\n", s_idx, col_nullability[col.first][s_idx] ? "yes" : "no");
-        }
-
-        // copy to device
-        nested_column_info[col.first].host_to_device(stream);
+      // real depth of the output cudf column hiearchy (1 == no nesting, 2 == 1 level, etc)
+      int nesting_depth = _metadata->get_nesting_depth(col.first);
+      printf("nesting_depth : %d, %d\n", col.first, nesting_depth);
+      if(nesting_depth > 1){
         has_nesting = true;
       }
+            
+      // IMPORTANT : see description of ColumnNestingInfo struct for information on how this is accessed
+      size_t size = leaf_schema.max_definition_level + 1;
+      printf("calloc size : %lu, %lu\n", size, nested_column_info.size());        
+      nested_column_info[col.first] = std::move(hostdevice_vector<gpu::ColumnNestingInfo>(size, size, stream));
+      
+      // fill in host-side nesting info
+      int schema_idx = _metadata->get_column_leaf_schema_index(col.first);
+      int output_col_idx = nesting_depth - 1;
+      int d = _metadata->schema[schema_idx].max_definition_level;
+      while(schema_idx > 0){        
+        // repetition type for this level
+        FieldRepetitionType repetition_type = _metadata->schema[schema_idx].repetition_type;
+        
+        int d = _metadata->schema[schema_idx].max_definition_level;
+
+        // values indexed by definition level
+        printf("Remap d:%d -> %d\n", d, output_col_idx);
+        nested_column_info[col.first][d].d_remap = output_col_idx;
+        
+        // REPEATED fields are not "real" output columns. they just indicate the field inside is a list
+        if(repetition_type != REPEATED){
+          // values indexed by output column index
+          nested_column_info[col.first][output_col_idx].o_max_def_level = d;
+          nested_column_info[col.first][output_col_idx].o_size = 0;
+          nested_column_info[col.first][output_col_idx].o_null_count = 0;
+          printf("NULL %d %d %d\n", d, output_col_idx, repetition_type);
+          nested_column_info[col.first][output_col_idx].o_nullable = repetition_type == OPTIONAL ? true : false;
+        } else {
+          // move up to the next output column
+          output_col_idx--;
+        }
+
+        // parent schema
+        schema_idx = _metadata->schema[schema_idx].parent_idx;
+      }
+
+      for(int s_idx=0; s_idx<=leaf_schema.max_definition_level; s_idx++){
+        printf("dcols[%d] : %d\n", s_idx, nested_column_info[col.first][s_idx].d_remap);
+      }
+      for(int s_idx=0; s_idx<nesting_depth; s_idx++){
+        printf("ocols[%d] : %s, %d\n", s_idx, nested_column_info[col.first][s_idx].o_nullable ? "yes" : "no",
+                                          nested_column_info[col.first][s_idx].o_max_def_level);
+      }
+
+      // copy to device
+      nested_column_info[col.first].host_to_device(stream);
     }
 
     // Initialize column chunk information
@@ -896,6 +894,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         printf("R / V : %d, %d\n", static_cast<int>(row_group.num_rows), static_cast<int>(col_meta.num_values));
         */
 
+        bool is_nested = cudf::is_nested(column_types[i]);
         chunks.insert(gpu::ColumnChunkDesc(col_meta.total_compressed_size,
                                            nullptr,
                                            col_meta.num_values,
@@ -913,7 +912,6 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                                            clock_rate,
                                            i,
                                            nested_column_info[i].device_ptr()));
-                                           // is_nested ? nested_column_info[i].device_ptr() : nullptr));
 
         // Map each column chunk to its column index
         chunk_map[chunks.size() - 1] = i;
@@ -967,29 +965,26 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         if(output_depth > 1){
           // retrieve computed info back to the host
           nested_column_info[i].device_to_host(stream);
-          printf("A\n"); 
 
           // the root buffer
-          printf("OBR : %d\n", column_types[i].id());
-          out_buffers.emplace_back(column_buffer{column_types[i], nested_column_info[i][0].size+1, col_nullability[i][0], stream, _mr});
+          out_buffers.emplace_back(column_buffer{column_types[i], nested_column_info[i][0].o_size+1, nested_column_info[i][0].o_nullable, stream, _mr});
           column_buffer* col = &out_buffers[out_buffers.size()-1];          
           // nested buffers
           for(int idx=1; idx<output_depth-1; idx++){            
             // note : all levels in a list column besides the leaf are offsets, so their length is always +1
-            printf("OBC : %d\n", column_types[i].id());
-            col->children.push_back(column_buffer{column_types[i], nested_column_info[i][idx].size+1,
-                                    col_nullability[i][idx], stream, _mr});            
+            col->children.push_back(column_buffer{column_types[i], nested_column_info[i][idx].o_size+1,
+                                    nested_column_info[i][idx].o_nullable, stream, _mr});            
             col = &col->children[0];                        
           }                    
-          // leaf buffer. note : the leaf type is not "LIST". it is a plain data type. 
-          printf("OBL : %d\n", to_type_id(leaf_schema, _strings_to_categorical, _timestamp_type.id()));
+          // leaf buffer. note : the leaf type is not "LIST". it is a plain data type.
           col->children.push_back(column_buffer{data_type{to_type_id(leaf_schema, _strings_to_categorical, _timestamp_type.id())},
-                        nested_column_info[i][output_depth-1].size, col_nullability[i][output_depth-1], stream, _mr});
+                        nested_column_info[i][output_depth-1].o_size, nested_column_info[i][output_depth-1].o_nullable, stream, _mr});
         }
         // other types
         else {
           // note : num_rows == # values for non-nested types
-          out_buffers.emplace_back(column_buffer{column_types[i], num_rows, col_nullability[i][0], stream, _mr});
+          printf("NULLABLE : %d\n", (int)nested_column_info[i][0].o_nullable);
+          out_buffers.emplace_back(column_buffer{column_types[i], num_rows, nested_column_info[i][0].o_nullable, stream, _mr});
         }
       }
 
@@ -1002,38 +997,16 @@ table_with_metadata reader::impl::read(size_type skip_rows,
 
         auto col = _selected_columns[i];
         auto &leaf_schema = _metadata->get_column_leaf_schema(col.first);
+        int nesting_depth = _metadata->get_nesting_depth(col.first);        
 
-        int output_depth = leaf_schema.max_repetition_level + 1;
-                        
         uint8_t buf[512];
         column_buffer* cb = &out_buffers[i];
-        for(int idx=0; idx<output_depth-1; idx++){          
-          cb->_null_count = nested_column_info[i][idx].null_count;
-          /*
-          cudaMemcpy(buf, cb->data(), cb->size * 4, cudaMemcpyDeviceToHost);
-          printf("offsets, depth %d : \n", idx);
-          for(int s_idx=0; s_idx<cb->size; s_idx++){
-            printf("%d, ", ((int*)buf)[s_idx]);
-          }
-          printf("\n");          
-          */
+        for(int idx=0; idx<nesting_depth; idx++){
+          cb->_null_count = nested_column_info[i][idx].o_null_count;
           cb = &cb->children[0];
         }
-        {
-          cb->_null_count = nested_column_info[i][output_depth-1].null_count;
-          /*
-          cudaMemcpy(buf, cb->data(), cb->size * 4, cudaMemcpyDeviceToHost);
-          printf("vals, depth %d : \n", output_depth-1);
-          for(int s_idx=0; s_idx<cb->size; s_idx++){
-            printf("%d, ", ((int*)buf)[s_idx]);
-          }
-          printf("\n");
-          */
-        }         
-        
-        // printf("OBE : %d %d\n", out_buffers[0].type.id(), out_buffers[0].children[0].type.id());
         out_columns.emplace_back(make_column(out_buffers[i], stream, _mr));
-      }      
+      }
     }
   }
 

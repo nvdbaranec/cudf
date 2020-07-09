@@ -295,13 +295,14 @@ bool CompactProtocolReader::InitSchema(FileMetaData *md)
   size_t idx;
   
   for(idx=0; idx<md->schema.size(); idx++){
-    printf("Schema[%d] type : %d, converted type : %d, name %s, parent : %d, repetition : %d, rep max : %d \n", (int)idx, 
+    printf("Schema[%d] type : %d, converted type : %d, name %s, parent : %d, repetition : %d, rep max : %d, def_max : %d \n", (int)idx, 
               md->schema[idx].type,
               md->schema[idx].converted_type,
               md->schema[idx].name.c_str(),
               md->schema[idx].parent_idx,
               (int)md->schema[idx].repetition_type,
-              md->schema[idx].max_repetition_level);
+              md->schema[idx].max_repetition_level,
+              md->schema[idx].max_definition_level);
   }  
 
   // Map columns to schema

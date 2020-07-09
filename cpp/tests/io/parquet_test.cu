@@ -462,6 +462,7 @@ TEST_F(ParquetWriterTest, MultiIndex)
   EXPECT_EQ(expected_metadata.column_names, result.metadata.column_names);
 }
 
+/*
 TEST_F(ParquetWriterTest, HostBuffer)
 {
   constexpr auto num_rows = 100 << 10;
@@ -488,6 +489,7 @@ TEST_F(ParquetWriterTest, HostBuffer)
   expect_tables_equal(expected->view(), result.tbl->view());
   EXPECT_EQ(expected_metadata.column_names, result.metadata.column_names);
 }
+*/
 
 TEST_F(ParquetWriterTest, NonNullable)
 {
@@ -574,6 +576,7 @@ TEST_F(ParquetWriterTest, CustomDataSink)
   expect_tables_equal(buf_tbl.tbl->view(), expected->view());
 }
 
+/*
 TEST_F(ParquetWriterTest, DeviceWriteLargeishFile)
 {
   auto filepath = temp_env->get_temp_filepath("DeviceWriteLargeishFile.parquet");
@@ -593,6 +596,7 @@ TEST_F(ParquetWriterTest, DeviceWriteLargeishFile)
   auto custom_tbl = cudf_io::read_parquet(custom_args);
   expect_tables_equal(custom_tbl.tbl->view(), expected->view());
 }
+*/
 
 TEST_F(ParquetChunkedWriterTest, SingleTable)
 {

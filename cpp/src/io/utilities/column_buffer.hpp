@@ -146,9 +146,17 @@ std::unique_ptr<column> make_column(
   cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource())
 {
+  using str_pair = thrust::pair<const char*, size_type>;
+
   switch(buffer.type.id()){
   case type_id::STRING:
     // printf("MAKE STRING\n");
+    {
+      thrust::host_vector<str_pair> hstr(buffer.__strings);
+      for(size_t idx=0; idx<hstr.size(); idx++){
+        printf("Str %lu : %lu\n", idx, (uint64_t)hstr[idx].first);
+      }
+    }
     return make_strings_column(buffer.__strings, stream, mr);
 
   case type_id::LIST:
