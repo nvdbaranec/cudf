@@ -22,7 +22,12 @@ namespace cudf {
 
 lists_column_view::lists_column_view(column_view const& lists_column) : column_view(lists_column)
 {
-  CUDF_EXPECTS(type().id() == type_id::LIST, "lists_column_view only supports lists");
+  if(lists_column.num_children() != 2){
+    int whee = 10;
+    whee++;
+  }  
+  CUDF_EXPECTS(lists_column.num_children() == 2, "lists_column_view must have 2 children");
+  CUDF_EXPECTS(type().id() == type_id::LIST, "lists_column_view only supports lists");  
 }
 
 column_view lists_column_view::parent() const { return static_cast<column_view>(*this); }

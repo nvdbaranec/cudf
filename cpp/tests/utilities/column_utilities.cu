@@ -380,7 +380,8 @@ std::string get_nested_type_str(cudf::column_view const& view)
   if (view.type().id() == cudf::type_id::LIST) {
     lists_column_view lcv(view);
     return cudf::jit::get_type_name(view.type()) + "<" +
-           (lcv.size() > 0 ? get_nested_type_str(lcv.child()) : "") + ">";
+           /*(lcv.size() > 0 ? get_nested_type_str(lcv.child()) : "")*/
+           get_nested_type_str(lcv.child()) + ">";
   }
   return cudf::jit::get_type_name(view.type());
 }
@@ -495,6 +496,7 @@ struct column_view_printer {
                            detail::to_string(bitmask_to_host(col), col.size(), indent) + "\n"
                        : "") +
       indent + "Children :\n" +
+      (lcv.child().type().id() != type_id::LIST && lcv.child().has_nulls() ? indent + detail::to_string(bitmask_to_host(lcv.child()), lcv.child().size(), indent) + "\n" : "") +
       (lcv.size() > 0 ? detail::to_string(lcv.child(), ", ", indent + "   ") : "") + "\n";
 
     out.push_back(tmp);
@@ -549,7 +551,8 @@ std::string to_string(std::vector<bitmask_type> const& null_mask,
 {
   std::ostringstream buffer;
   buffer << indent;
-  for (int idx = null_mask_size - 1; idx >= 0; idx--) {
+  // for (int idx = null_mask_size - 1; idx >= 0; idx--) {
+  for (int idx = 0; idx<null_mask_size; idx++) {
     buffer << (cudf::bit_is_set(null_mask.data(), idx) ? "1" : "0");
   }
   return buffer.str();

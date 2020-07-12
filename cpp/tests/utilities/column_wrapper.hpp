@@ -503,7 +503,7 @@ class lists_column_wrapper : public detail::column_wrapper {
    */
   template <typename Element = T, std::enable_if_t<cudf::is_fixed_width<Element>()>* = nullptr>
   lists_column_wrapper(std::initializer_list<T> elements) : column_wrapper{}
-  {
+  {    
     build_from_non_nested(std::move(cudf::test::fixed_width_column_wrapper<T>(elements).release()));
   }
 
@@ -526,7 +526,7 @@ class lists_column_wrapper : public detail::column_wrapper {
             typename InputIterator,
             std::enable_if_t<cudf::is_fixed_width<Element>()>* = nullptr>
   lists_column_wrapper(InputIterator begin, InputIterator end) : column_wrapper{}
-  {
+  {    
     build_from_non_nested(std::move(
       cudf::test::fixed_width_column_wrapper<typename InputIterator::value_type>(begin, end)
         .release()));
@@ -551,7 +551,7 @@ class lists_column_wrapper : public detail::column_wrapper {
             typename ValidityIterator,
             std::enable_if_t<cudf::is_fixed_width<Element>()>* = nullptr>
   lists_column_wrapper(std::initializer_list<T> elements, ValidityIterator v) : column_wrapper{}
-  {
+  {    
     build_from_non_nested(
       std::move(cudf::test::fixed_width_column_wrapper<T>(elements, v).release()));
   }
@@ -579,7 +579,7 @@ class lists_column_wrapper : public detail::column_wrapper {
             std::enable_if_t<cudf::is_fixed_width<Element>()>* = nullptr>
   lists_column_wrapper(InputIterator begin, InputIterator end, ValidityIterator v)
     : column_wrapper{}
-  {
+  {    
     build_from_non_nested(
       std::move(cudf::test::fixed_width_column_wrapper<T>(begin, end, v).release()));
   }
@@ -673,6 +673,12 @@ class lists_column_wrapper : public detail::column_wrapper {
     build_from_non_nested(make_empty_column(cudf::data_type{cudf::type_to_id<T>()}));
   }
 
+  lists_column_wrapper(lists_column_wrapper<T> const& l) : column_wrapper{}
+  {
+    std::vector<bool> valids;
+    build_from_nested({l}, valids);
+  }
+
   /**
    * @brief Construct a lists column of nested lists from an initializer list of values
    * and a validity iterator.
@@ -731,31 +737,33 @@ class lists_column_wrapper : public detail::column_wrapper {
                          std::vector<bool> const& v)
   {
     auto valids = cudf::test::make_counting_transform_iterator(
-      0, [&v](auto i) { return v.empty() ? true : v[i]; });
+      0, [&v](auto i) { return v.empty() ? true : v[i]; });    
 
     // preprocess the incoming lists. unwrap any "root" lists and just use their
     // underlying non-list data.
     // also, sanity check everything to make sure the types of all the columns are the same
     std::vector<column_view> cols;
     type_id child_id = type_id::EMPTY;
-    std::transform(elements.begin(),
-                   elements.end(),
-                   std::back_inserter(cols),
-                   [&child_id](lists_column_wrapper const& l) {
-                     // potentially unwrap
-                     cudf::column_view col =
-                       l.root ? lists_column_view(*l.wrapped).child() : *l.wrapped;
+      std::transform(elements.begin(),
+                    elements.end(),
+                    std::back_inserter(cols),
+                    [&child_id](lists_column_wrapper const& l) {
+                      // potentially unwrap
+                      cudf::column_view col =
+                        l.root ? lists_column_view(*l.wrapped).child() : *l.wrapped;
 
-                     // verify all children are of the same type (C++ allows you to use initializer
-                     // lists that could construct an invalid list column type)
-                     if (child_id == type_id::EMPTY) {
-                       child_id = col.type().id();
-                     } else {
-                       CUDF_EXPECTS(child_id == col.type().id(), "Mismatched list types");
-                     }
-
-                     return col;
-                   });
+                      if(child_id == type_id::EMPTY){
+                        child_id = col.type().id();                       
+                      }                       
+                      else {
+                        // handle the case where we have incomplete hierarchies. see comment
+                        // below in the concatenate step.
+                        if(child_id != type_id::LIST && col.type().id() == type_id::LIST){
+                          child_id = type_id::LIST;
+                        }
+                      }
+                      return col;
+                    });
 
     // generate offsets column and do some type checking to make sure the user hasn't passed an
     // invalid initializer list
@@ -778,10 +786,19 @@ class lists_column_wrapper : public detail::column_wrapper {
 
     // concatenate them together, skipping data for children that are null
     std::vector<column_view> children;
-    for (size_t idx = 0; idx < cols.size(); idx++) {
-      if (valids[idx]) { children.push_back(cols[idx]); }
-    }
-    auto data = concatenate(children);
+    for (size_t idx = 0; idx < cols.size(); idx++) {      
+      if (!valids[idx]) { 
+        continue;
+      }
+
+      if(child_id == type_id::LIST && cols[idx].type().id() != type_id::LIST){
+        continue;
+      }
+      children.push_back(cols[idx]);
+    }   
+    //printf("CHILDREN E : %d\n", children.empty() ? 1 : 0);
+    auto data = children.empty() ? make_empty_column(cudf::data_type{cudf::type_to_id<T>()})
+                                 : concatenate(children);
 
     // construct the list column
     wrapped = make_lists_column(
@@ -790,6 +807,10 @@ class lists_column_wrapper : public detail::column_wrapper {
       std::move(data),
       v.size() <= 0 ? 0 : cudf::UNKNOWN_NULL_COUNT,
       v.size() <= 0 ? rmm::device_buffer{0} : detail::make_null_mask(v.begin(), v.end()));
+    lists_column_view lcv(*wrapped);
+    //printf("NUM CHILDREN : %d\n", lcv.parent().num_children());
+    column_view child = lcv.child();
+    //printf("CHILD %d %d\n", child.type().id(), child.num_children());
   }
 
   /**
@@ -800,8 +821,8 @@ class lists_column_wrapper : public detail::column_wrapper {
    *
    */
   void build_from_non_nested(std::unique_ptr<column> c)
-  {
-    CUDF_EXPECTS(!cudf::is_nested(c->type()), "Unexpected nested type");
+  {    
+    CUDF_EXPECTS(c->type().id() == type_id::EMPTY || !cudf::is_nested(c->type()), "Unexpected type");
 
     std::vector<size_type> offsetv;
     offsetv.push_back(0);
@@ -810,11 +831,11 @@ class lists_column_wrapper : public detail::column_wrapper {
       cudf::test::fixed_width_column_wrapper<size_type>(offsetv.begin(), offsetv.end()).release();
 
     // construct the list column. mark this as a root
-    root    = true;
+    root = true;
     wrapped = make_lists_column(
-      offsetv.size() - 1, std::move(offsets), std::move(c), 0, rmm::device_buffer{0});
+                offsetv.size() - 1, std::move(offsets), std::move(c), 0, rmm::device_buffer{0});
   }
-
+ 
   bool root = false;
 };
 

@@ -26,6 +26,8 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <../tests/utilities/column_utilities.hpp>
+
 #include <rmm/thrust_rmm_allocator.h>
 #include <rmm/device_buffer.hpp>
 
@@ -49,6 +51,8 @@ inline rmm::device_buffer create_data(
   cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource())
 {
+  // printf("create_data : %d, %d\n", (int)type.id(), (int)size);
+
   std::size_t data_size = size_of(type) * size;
 
   rmm::device_buffer data(data_size, stream, mr);
@@ -62,25 +66,47 @@ inline rmm::device_buffer create_data(
  * eventually used create to create a column.
  */
 struct column_buffer {
+  // there is a potential bug here.  In the decoding step, the buffer of 
+  // data holding these pairs is cast to an nvstrdesc_s, which is a struct
+  // containing <const char *, size_t>.   So there is a mismatch between the
+  // size_type and the size_t.  I believe this works because the str_pair is 
+  // aligned out to 8 bytes anyway.
   using str_pair = thrust::pair<const char*, size_type>;
 
-  column_buffer(data_type type,
-                size_type size,
+  column_buffer() = default;
+
+  column_buffer(data_type _type,
+                size_type _size,
                 bool is_nullable                    = true,
                 cudaStream_t stream                 = 0,
                 rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource())
-  {
-    if (type.id() == type_id::STRING) {
-      _strings.resize(size);
-    } else {
+  {    
+    type = _type;
+    size = _size;
+
+    // printf("COLUMN BUFFER : %d %d\n", type.id(), size);
+
+    switch(type.id()){
+    case type_id::STRING:    
+      __strings.resize(size);
+      break;
+
+    // list columns store a buffer of int32's as offsets to represent
+    // their individual rows
+    case type_id::LIST:
+      _data = create_data(data_type{type_id::INT32}, size, stream, mr);
+      break;
+
+    default:    
       _data = create_data(type, size, stream, mr);
+      break;
     }
     if (is_nullable) { _null_mask = create_null_mask(size, mask_state::ALL_NULL, stream, mr); }
     _null_count = 0;
   }
 
-  auto data() { return _strings.size() ? _strings.data().get() : _data.data(); }
-  auto data_size() { return std::max(_data.size(), _strings.size() * sizeof(str_pair)); }
+  auto data() { return __strings.size() ? __strings.data().get() : _data.data(); }
+  auto data_size() { return std::max(_data.size(), __strings.size() * sizeof(str_pair)); }
 
   template <typename T = uint32_t>
   auto null_mask()
@@ -91,19 +117,23 @@ struct column_buffer {
 
   auto& null_count() { return _null_count; }
 
-  rmm::device_vector<str_pair> _strings;
+  rmm::device_vector<str_pair> __strings;
   rmm::device_buffer _data{};
   rmm::device_buffer _null_mask{};
   size_type _null_count{0};
+  
+  data_type type{type_id::EMPTY};
+  size_type size{0}; 
+  std::vector<column_buffer> children;
 };
 
 namespace {
 /**
- * @brief Creates a column from an existing set of device memory buffers.
+ * @brief Creates a column from an existing set of device memory buffers.   
  *
  * @throws std::bad_alloc if device memory allocation fails
  *
- * @param type List of column chunk descriptors
+ * @param buffer Column buffer descriptroe
  * @param size List of page information
  * @param size List of page information
  * @param stream CUDA stream used for device memory operations and kernel launches.
@@ -112,17 +142,45 @@ namespace {
  * @return `std::unique_ptr<cudf::column>` Column from the existing device data
  */
 std::unique_ptr<column> make_column(
-  data_type type,
-  size_type size,
   column_buffer& buffer,
   cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource())
 {
-  if (type.id() == type_id::STRING) {
-    return make_strings_column(buffer._strings, stream, mr);
-  } else {
-    return std::make_unique<column>(
-      type, size, std::move(buffer._data), std::move(buffer._null_mask), buffer._null_count);
+  using str_pair = thrust::pair<const char*, size_type>;
+
+  switch(buffer.type.id()){
+  case type_id::STRING:
+    // printf("MAKE STRING\n");
+    {
+      thrust::host_vector<str_pair> hstr(buffer.__strings);
+      for(size_t idx=0; idx<hstr.size(); idx++){
+        printf("Str %lu : %lu\n", idx, (uint64_t)hstr[idx].first);
+      }
+    }
+    return make_strings_column(buffer.__strings, stream, mr);
+
+  case type_id::LIST:
+    {      
+      // make offsets column
+      auto offsets = std::make_unique<column>(data_type{type_id::INT32}, buffer.size, std::move(buffer._data));
+      
+      // make child column
+      CUDF_EXPECTS(buffer.children.size() > 0, "Encountered malformed column_buffer");
+      auto child = make_column(buffer.children[0], stream, mr);
+
+      // make the final list column (note : size is the # of offsets, so our actual # of rows is 1 less)            
+      //printf("LIST CONSTRUCT : %d, %lu\n", buffer._null_count, (uint64_t)buffer._null_mask.data());
+      return make_lists_column(buffer.size-1, std::move(offsets), std::move(child), buffer._null_count, std::move(buffer._null_mask), stream, mr);
+    }
+    break;
+
+  default:  
+    {       
+      //printf("LEAF CONSTRUCT : %d, %lu\n", buffer._null_count, (uint64_t)buffer._null_mask.data());
+      auto chk = std::make_unique<column>(
+        buffer.type, buffer.size, std::move(buffer._data), std::move(buffer._null_mask), buffer._null_count);
+      return chk;
+    }
   }
 }
 

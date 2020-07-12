@@ -45,7 +45,7 @@ const uint8_t CompactProtocolReader::g_list2struct[16] = {0,
  * @param[in] depth Level of struct nesting
  *
  * @return True if the struct type is recognized, false otherwise
- **/
+ */
 bool CompactProtocolReader::skip_struct_field(int t, int depth)
 {
   switch (t) {
@@ -286,7 +286,7 @@ PARQUET_END_STRUCT()
  * @param[in] md File metadata that was previously parsed
  *
  * @return True if schema constructed completely, false otherwise
- **/
+ */
 bool CompactProtocolReader::InitSchema(FileMetaData *md)
 {
   if (WalkSchema(md->schema) != md->schema.size()) return false;
@@ -312,9 +312,15 @@ bool CompactProtocolReader::InitSchema(FileMetaData *md)
         }();
         if (it == md->schema.cend()) return false;
         current_row_group = std::distance(md->schema.cbegin(), it);
-        column.schema_idx = current_row_group;
+        
+        // if the schema index is already pointing at a nested type, we'll leave it alone.
+        if(column.schema_idx < 0 || md->schema[column.schema_idx].converted_type != parquet::LIST){
+          column.schema_idx = current_row_group;
+        }
+        column.leaf_schema_idx = current_row_group;
         parent            = current_row_group;
       }
+      printf("CSIL : %d %d\n", column.schema_idx, column.leaf_schema_idx);
     }
   }
   return true;
@@ -330,7 +336,7 @@ bool CompactProtocolReader::InitSchema(FileMetaData *md)
  * @param[in] max_rep_level Max repetition level
  *
  * @return The node index that was populated
- **/
+ */
 int CompactProtocolReader::WalkSchema(
   std::vector<SchemaElement> &schema, int idx, int parent_idx, int max_def_level, int max_rep_level)
 {
@@ -342,6 +348,7 @@ int CompactProtocolReader::WalkSchema(
       ++max_def_level;
       ++max_rep_level;
     }
+    printf("SCHEMA : %d %d %d %d\n", idx, e->converted_type, max_def_level, max_rep_level);
     e->max_definition_level = max_def_level;
     e->max_repetition_level = max_rep_level;
     e->parent_idx           = parent_idx;
@@ -361,11 +368,9 @@ int CompactProtocolReader::WalkSchema(
   }
 }
 
-/* ----------------------------------------------------------------------------*/
 /**
  * @Brief Parquet CompactProtocolWriter class
  **/
-/* ----------------------------------------------------------------------------*/
 
 #define CPW_BEGIN_STRUCT(st)                       \
   size_t CompactProtocolWriter::write(const st *s) \

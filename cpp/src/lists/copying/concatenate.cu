@@ -90,19 +90,39 @@ std::unique_ptr<column> concatenate(
       return lists_column_view(c);
     });
 
+  // determine expected leaf type
+  type_id expected_leaf_type = type_id::EMPTY;
+  std::for_each(lists_columns.begin(),
+                 lists_columns.end(),
+                 [&expected_leaf_type](lists_column_view const& l) {
+                      if(expected_leaf_type == type_id::EMPTY){ 
+                        expected_leaf_type = l.child().type().id(); 
+                      } else {
+                        if(expected_leaf_type != type_id::LIST && l.child().type().id() == type_id::LIST){                        
+                          expected_leaf_type = type_id::LIST;
+                        }
+                      }
+                 }
+  );
+
   // concatenate children. also prep data needed for offset merging
   std::vector<column_view> children;
   children.reserve(columns.size());
   size_type total_list_count = 0;
-  std::transform(lists_columns.begin(),
+  std::for_each(lists_columns.begin(),
                  lists_columns.end(),
-                 std::back_inserter(children),
-                 [&total_list_count, &children](lists_column_view const& l) {
+                 [&total_list_count, &children, expected_leaf_type](lists_column_view const& l) {
                    // count total # of lists
                    total_list_count += l.size();
+
+                   bool is_empty_mismatched_child = 
+                    l.child().type().id() != expected_leaf_type && l.child().size() == 0;
+
                    // child column. could be a leaf type (string, float, int, etc) or more nested
                    // lists
-                   return l.child();
+                   if(l.size() > 0 && !is_empty_mismatched_child){
+                     children.push_back(l.child());
+                   }
                  });
   auto data = cudf::detail::concatenate(children, mr, stream);
 

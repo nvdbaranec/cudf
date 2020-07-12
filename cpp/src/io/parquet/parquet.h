@@ -115,6 +115,10 @@ struct ColumnChunk {
 
   // Following fields are derived from other fields
   int schema_idx = -1;  // Index in flattened schema (derived from path_in_schema)
+  // if this is a non-nested type, this index will be the same as schema_idx.
+  // for a nested type, this will point to the fundamental leaf type schema
+  // element (int, string, etc)
+  int leaf_schema_idx   = -1;
 };
 
 /**
