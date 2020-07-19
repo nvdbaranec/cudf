@@ -459,6 +459,8 @@ void gather_bitmask(table_view const& source,
       auto const state =
         op == gather_bitmask_op::PASSTHROUGH ? mask_state::ALL_VALID : mask_state::UNINITIALIZED;
       auto mask = create_null_mask(target[i]->size(), state, stream, mr);
+
+      printf("NULLIFYING\n");
       target[i]->set_null_mask(std::move(mask), 0);
     }
   }

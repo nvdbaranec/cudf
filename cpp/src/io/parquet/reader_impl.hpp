@@ -127,8 +127,23 @@ class reader::impl {
    * @return Device buffer to decompressed page data
    */
   rmm::device_buffer decompress_page_data(hostdevice_vector<gpu::ColumnChunkDesc> &chunks,
-                                          hostdevice_vector<gpu::PageInfo> &pages,
+                                          hostdevice_vector<gpu::PageInfo> &pages,                                          
                                           cudaStream_t stream);
+
+  void allocate_nesting_info(hostdevice_vector<gpu::ColumnChunkDesc> &chunks,
+                              hostdevice_vector<gpu::PageInfo> &pages,
+                              hostdevice_vector<gpu::PageNestingInfo> &page_nesting_info,                                         
+                              std::vector<std::vector<std::pair<int, bool>>>& col_nesting_info,
+                              int num_columns,
+                              cudaStream_t stream);
+
+  void preprocess_nested_columns(hostdevice_vector<gpu::ColumnChunkDesc> &chunks,
+                                 hostdevice_vector<gpu::PageInfo> &pages,
+                                 hostdevice_vector<gpu::PageNestingInfo> &page_nesting_info,
+                                 std::vector<std::vector<std::pair<int, bool>>>& nested_sizes,
+                                 size_t min_row,
+                                 size_t total_rows,
+                                 cudaStream_t stream);
 
   /**
    * @brief Converts the page data and outputs to columns.
@@ -145,8 +160,8 @@ class reader::impl {
                         hostdevice_vector<gpu::PageInfo> &pages,
                         size_t min_row,
                         size_t total_rows,
-                        const std::vector<int> &chunk_map,
                         std::vector<column_buffer> &out_buffers,
+                        bool has_nesting,
                         cudaStream_t stream);
 
  private:

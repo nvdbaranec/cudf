@@ -437,7 +437,7 @@ rmm::device_buffer reader::impl::decompress_stripe_data(
 
   rmm::device_buffer decomp_data(total_decomp_size, stream);
   rmm::device_vector<gpu_inflate_input_s> inflate_in(num_compressed_blocks +
-                                                     num_uncompressed_blocks);
+                                                     num_uncompressed_blocks); 
   rmm::device_vector<gpu_inflate_status_s> inflate_out(num_compressed_blocks);
 
   // Parse again to populate the decompression input/output buffers
@@ -813,8 +813,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                          stream);
 
       for (size_t i = 0; i < column_types.size(); ++i) {
-        out_columns.emplace_back(
-          make_column(column_types[i], num_rows, out_buffers[i], stream, _mr));
+        out_columns.emplace_back(make_column(out_buffers[i], stream, _mr));
       }
     }
   }

@@ -123,6 +123,7 @@ std::unique_ptr<column> gather_list_leaf(column_view const& column,
       stream,
       mr);
 
+    printf("HMM\n");
     leaf_column->set_null_mask(std::move(validity.first), validity.second);
   }
 
@@ -143,6 +144,11 @@ std::unique_ptr<column> gather_list_nested(cudf::lists_column_view const& list,
     thrust::make_counting_iterator<size_type>(0), list_gatherer{gd});
   size_type gather_map_size = gd.gather_map_size;
 
+  // if we have an empty gather map, return an empty list.  
+  if(gather_map_size == 0){
+    return make_empty_column(data_type{type_id::LIST});
+  }
+
   // gather the bitmask, if relevant
   rmm::device_buffer null_mask{0, stream, mr};
   size_type null_count = list.null_count();
@@ -161,7 +167,7 @@ std::unique_ptr<column> gather_list_nested(cudf::lists_column_view const& list,
   // generate gather_data for next level (N+1), potentially recycling the temporary
   // base_offsets buffer.
   gather_data child_gd = make_gather_data<false>(
-    list, gather_map_begin, gather_map_size, stream, mr, std::move(gd.base_offsets));
+    list, gather_map_begin, gather_map_size, stream, mr, std::move(gd.base_offsets));  
 
   // the nesting case.
   if (list.child().type() == cudf::data_type{type_id::LIST}) {

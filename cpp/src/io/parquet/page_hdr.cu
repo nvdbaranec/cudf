@@ -17,6 +17,8 @@
 #include <io/utilities/block_utils.cuh>
 #include "parquet_gpu.h"
 
+#include "printer.hpp"
+
 namespace cudf {
 namespace io {
 namespace parquet {
@@ -191,7 +193,7 @@ PARQUET_END_STRUCT()
  *
  * @param[in] chunks List of column chunks
  * @param[in] num_chunks Number of column chunks
- **/
+ */
 // blockDim {128,1,1}
 extern "C" __global__ void __launch_bounds__(128)
   gpuDecodePageHeaders(ColumnChunkDesc *chunks, int32_t num_chunks)
@@ -214,15 +216,19 @@ extern "C" __global__ void __launch_bounds__(128)
     uint32_t data_page_count       = 0;
     uint32_t dictionary_page_count = 0;
     int32_t max_num_pages;
-    int32_t num_dict_pages = bs->ck.num_dict_pages;
+    int32_t num_dict_pages = bs->ck.num_dict_pages; 
     PageInfo *page_info;
 
     if (!t) {
       bs->base = bs->cur = bs->ck.compressed_data;
       bs->end            = bs->base + bs->ck.compressed_size;
       bs->page.chunk_idx = chunk;
-      bs->page.chunk_row = 0;
-      bs->page.num_rows  = 0;
+      bs->page.column_idx = bs->ck.col_index;
+      // this computation is only valid for flat schemas. for nested schemas, 
+      // they will be recomputed in the preprocess step by examining repetition and
+      // definition levels
+      bs->page.chunk_row   = 0;      
+      bs->page.num_rows    = 0; 
     }
     num_values     = bs->ck.num_values;
     page_info      = bs->ck.page_info;
@@ -230,21 +236,23 @@ extern "C" __global__ void __launch_bounds__(128)
     max_num_pages  = (page_info) ? bs->ck.max_num_pages : 0;
     values_found   = 0;
     SYNCWARP();
+    int loop = 0;
     while (values_found < num_values && bs->cur < bs->end) {
       int index_out = -1;
 
       if (t == 0) {
-        bs->page.chunk_row += bs->page.num_rows;
+        // this computation is only valid for flat schemas. for nested schemas,
+        // they will be recomputed in the preprocess step by examining repetition and
+        // definition levels
+        bs->page.chunk_row += bs->page.num_rows;                
         bs->page.num_rows = 0;
         if (gpuParsePageHeader(bs) && bs->page.compressed_page_size >= 0) {
           switch (bs->page_type) {
             case DATA_PAGE:
-              // TODO: Unless the file only uses V2 page headers or has no complex nesting (num_rows
-              // == num_values), we can't infer num_rows at this time
-              // -> we'll need another pass after decompression to parse the definition and
-              // repetition levels to infer the correct value of num_rows
-              bs->page.num_rows = bs->page.num_values;  // Assumes num_rows == num_values
-                                                        // Fall-through to V2
+              // this computation is only valid for flat schemas. for nested schemas, 
+              // they will be recomputed in the preprocess step by examining repetition and
+              // definition levels
+              bs->page.num_rows = bs->page.num_values;
             case DATA_PAGE_V2:
               index_out = num_dict_pages + data_page_count;
               data_page_count++;
@@ -273,10 +281,20 @@ extern "C" __global__ void __launch_bounds__(128)
       }
       num_values = SHFL0(num_values);
       SYNCWARP();
+
+      loop++;
     }
     if (t == 0) {
       chunks[chunk].num_data_pages = data_page_count;
       chunks[chunk].num_dict_pages = dictionary_page_count;
+
+      // if we are the last chunk, mark our last page as the terminator
+      if(chunks[chunk].terminator && chunks[chunk].page_info != nullptr){
+        int total_pages = data_page_count + dictionary_page_count;
+        printf("CHUNK CHECK : %d, %d, %lu\n", chunk, total_pages, (uint64_t)chunks[chunk].page_info);
+        chunks[chunk].page_info[total_pages-1].flags |= PAGEINFO_FLAGS_TERMINATOR;
+        printf("Marked chunk %d (col %d), page %d as terminator\n", chunk, chunks[chunk].col_index, total_pages-1);
+      }
     }
   }
 }
@@ -291,7 +309,7 @@ extern "C" __global__ void __launch_bounds__(128)
  *
  * @param[in] chunks List of column chunks
  * @param[in] num_chunks Number of column chunks
- **/
+ */
 // blockDim {128,1,1}
 extern "C" __global__ void __launch_bounds__(128)
   gpuBuildStringDictionaryIndex(ColumnChunkDesc *chunks, int32_t num_chunks)
