@@ -172,7 +172,7 @@ TYPED_TEST(ParquetWriterNumericTypeTest, SingleColumn)
 {
   auto sequence =
     cudf::test::make_counting_transform_iterator(0, [](auto i) { return TypeParam(i); });
-  auto validity = cudf::test::make_counting_transform_iterator(0, [](auto i) { return true; });
+  auto validity = cudf::test::make_counting_transform_iterator(0, [](auto i) { return i%2 == 0 ? false : true; });
 
   constexpr auto num_rows = 100;
   column_wrapper<TypeParam> col(sequence, sequence + num_rows, validity);

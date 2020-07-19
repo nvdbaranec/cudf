@@ -47,8 +47,6 @@ std::unique_ptr<column> make_lists_column(size_type num_rows,
                                   null_mask,
                                   null_count,
                                   std::move(children));
-
-  printf("LC nullable : %s\n", res->nullable() ? "yes" : "no");
   return std::move(res);
 }
 

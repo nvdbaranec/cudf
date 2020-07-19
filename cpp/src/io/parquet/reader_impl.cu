@@ -922,12 +922,23 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc> &chu
     pages.host_ptr(), pages.device_ptr(), pages.memory_size(), cudaMemcpyDeviceToHost, stream));
   CUDA_TRY(cudaStreamSynchronize(stream));
 
+  // update null counts  
   /*
   for (size_t i = 0; i < pages.size(); i++) {
-    if (pages[i].num_rows > 0) {
-      const size_t c = pages[i].chunk_idx;
-      if (c < chunks.size()) {
-        out_buffers[chunk_col_map[c]].null_count() += pages[i].num_rows - pages[i].valid_count;
+    PageInfo *pi = &pages[i];
+
+    if (pi->]num_rows > 0) {
+      const size_t c = pi->chunk_idx;
+      if (c < chunks.size()) {       
+        ColumnChunkDesc *col = &chunks[c];
+        column_buffer *out = &out_buffers[c];
+        int max_depth   = col->max_level[level_type::REPETITION]; 
+        
+        for(int idx=0; idx<max_depth; idx++){
+          out_buffers[chunk_col_map[c]].null_count() += pages[i].num_rows - pages[i].valid_count;
+
+          out
+        }
       }
     }
   }
@@ -1166,6 +1177,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         else {
           // note : num_rows == # values for non-nested types
           bool is_nullable = leaf_schema.max_definition_level != 0;
+          // printf("Nullable (%d) : %s\n", leaf_schema.max_definition_level, is_nullable ? "yes" : "no");
           out_buffers.emplace_back(column_buffer{column_types[i], num_rows, is_nullable, stream, _mr});
         }
       }

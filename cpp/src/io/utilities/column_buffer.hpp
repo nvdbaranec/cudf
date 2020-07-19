@@ -143,14 +143,7 @@ std::unique_ptr<column> make_column(
   using str_pair = thrust::pair<const char*, size_type>;
 
   switch (buffer.type.id()) {
-    case type_id::STRING:
-      // printf("MAKE STRING\n");
-      {
-        thrust::host_vector<str_pair> hstr(buffer.__strings);
-        for (size_t idx = 0; idx < hstr.size(); idx++) {
-          printf("Str %lu : %lu\n", idx, (uint64_t)hstr[idx].first);
-        }
-      }
+    case type_id::STRING: 
       return make_strings_column(buffer.__strings, stream, mr);
 
     case type_id::LIST: {

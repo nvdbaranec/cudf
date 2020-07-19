@@ -79,10 +79,11 @@ struct PageNestingInfo {
   int32_t o_size;
   int32_t o_null_count;  
   int32_t o_page_start_value;
-  
-  int32_t o_valid_map_offset;
+    
   int32_t o_valid_count;
   int32_t o_value_count;
+
+  int32_t o_valid_map_offset;     // in bits relative to valid_map  
 
   uint8_t *data_out;
   uint32_t *valid_map;
