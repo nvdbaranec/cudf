@@ -53,6 +53,7 @@ class hostdevice_vector {
   {
     if (max_elements != 0) {
       CUDA_TRY(cudaMallocHost(&h_data, sizeof(T) * max_elements));
+      new (h_data) T[max_elements];
       d_data.resize(sizeof(T) * max_elements, stream);
     }
   }

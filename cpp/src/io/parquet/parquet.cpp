@@ -288,8 +288,14 @@ PARQUET_END_STRUCT()
  * @return True if schema constructed completely, false otherwise
  */
 bool CompactProtocolReader::InitSchema(FileMetaData *md)
-{
-  if (WalkSchema(md->schema) != md->schema.size()) return false;
+{  
+  /*
+  for(size_t idx=0; idx<md->key_value_metadata.size(); idx++){
+    printf("MD : %s %s\n", md->key_value_metadata[idx].key.c_str(), md->key_value_metadata[idx].value.c_str());
+  }
+  */
+
+  if (WalkSchema(md) != md->schema.size()) return false; 
 
   /* Inside FileMetaData, there is a std::vector of RowGroups and each RowGroup contains a
    * a std::vector of ColumnChunks. Each ColumnChunk has a member ColumnMetaData, which contains
@@ -314,15 +320,19 @@ bool CompactProtocolReader::InitSchema(FileMetaData *md)
         current_schema_index = std::distance(md->schema.cbegin(), it);
 
         // if the schema index is already pointing at a nested type, we'll leave it alone.
+        /*
         if (column.schema_idx < 0 ||
             md->schema[column.schema_idx].converted_type != parquet::LIST) {
           column.schema_idx = current_schema_index;
         }
         column.leaf_schema_idx = current_schema_index;
-        parent                 = current_schema_index;
+        */
+        column.schema_idx = current_schema_index;
+        parent            = current_schema_index;
       }
     }
   }
+
   return true;
 }
 
@@ -338,10 +348,12 @@ bool CompactProtocolReader::InitSchema(FileMetaData *md)
  * @return The node index that was populated
  */
 int CompactProtocolReader::WalkSchema(
-  std::vector<SchemaElement> &schema, int idx, int parent_idx, int max_def_level, int max_rep_level)
-{
-  if (idx >= 0 && (size_t)idx < schema.size()) {
-    SchemaElement *e = &schema[idx];
+  FileMetaData *md,
+  int idx, int parent_idx, int max_def_level, int max_rep_level,
+  std::vector<std::string> const& parent_path_in_schema)
+{  
+  if (idx >= 0 && (size_t)idx < md->schema.size()) {    
+    SchemaElement *e = &md->schema[idx];
     if (e->repetition_type == OPTIONAL) {
       ++max_def_level;
     } else if (e->repetition_type == REPEATED) {
@@ -351,12 +363,50 @@ int CompactProtocolReader::WalkSchema(
     e->max_definition_level = max_def_level;
     e->max_repetition_level = max_rep_level;
     e->parent_idx           = parent_idx;
-    parent_idx              = idx;
+    printf("Schema %d, %s, max_def_level %d, parent : %d\n", idx, e->name.c_str(), max_def_level, parent_idx);
+
+    std::vector<std::string> path_in_schema = parent_path_in_schema;
+    // ignore the root schema element
+    if(idx > 0){
+      path_in_schema.push_back(e->name);
+    }
+
+    // inject struct columns.  parquet doesn't explicitly store column data for structs.
+    // consider the following schema:
+    // name  (struct)
+    //    first  (string)
+    //    middle (string)
+    //    last   (string)
+    //
+    // the struct column "name" will not have a corresponding column (ColumnChunk) in the file.
+    // this appears to be because a.) there is no data stored for the actual column,  b.) any
+    // validity information is encoded in the repetition/definition streams for the child columns
+    // (first, middle, last).  however the way this code is structured, it makes things significantly
+    // easier if we insert a "fake" column that represents the struct column.        
+    /*
+    if((idx > 0) && e->is_struct()){
+      ColumnChunk struct_col;
+      struct_col.meta_data.type = UNDEFINED_TYPE;
+      struct_col.meta_data.path_in_schema = path_in_schema;
+
+      printf("ADDING STRUCT COLUMN NAMED : ");
+      for(size_t idx=0; idx<path_in_schema.size(); idx++){
+        printf("%s.", path_in_schema[idx].c_str());
+      }
+      printf("\n");
+      
+      for(size_t idx=0; idx<md->row_groups.size(); idx++){
+        md->row_groups[idx].columns.push_back(struct_col);
+      }
+    } 
+    */   
+
+    parent_idx              = idx;    
     ++idx;
     if (e->num_children > 0) {
       for (int i = 0; i < e->num_children; i++) {
         int idx_old = idx;
-        idx         = WalkSchema(schema, idx, parent_idx, max_def_level, max_rep_level);
+        idx         = WalkSchema(md, idx, parent_idx, max_def_level, max_rep_level, path_in_schema);
         if (idx <= idx_old) break;  // Error
       }
     }
