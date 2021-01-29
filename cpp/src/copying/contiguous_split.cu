@@ -87,16 +87,19 @@ struct src_buf_info {
  * M partitions, then we have N*M destination buffers.
  */
 struct dst_buf_info {
-  size_t buf_size;   // total size of buffer, including padding
-  int num_elements;  // # of elements to be copied
-  int element_size;  // size of each element in bytes
-  int num_rows;  // # of rows (which may be different from num_elements in the case of validity or
-                 // offset buffers)
-  int src_row_index;  // row index to start reading from from my associated source buffer
-  int dst_offset;     // my offset into the per-partition allocation
-  int value_shift;    // amount to shift values down by (for offset buffers)
-  int bit_shift;      // # of bits to shift right by (for validity buffers)
+  size_t buf_size;        // total size of buffer, including padding
+  int num_elements;       // # of elements to be copied
+  int element_size;       // size of each element in bytes
+  int num_rows;           // # of rows (which may be different from num_elements in the case of validity or
+                          // offset buffers)
+  int src_row_index;      // row index to start reading from from my associated source buffer
+  int dst_offset;         // my offset into the per-partition allocation
+  int value_shift;        // amount to shift values down by (for offset buffers)
+  int bit_shift;          // # of bits to shift right by (for validity buffers)
+  size_type valid_count;   
 };
+
+constexpr size_type copy_block_size = 512;
 
 /**
  * @brief Copy a single buffer of column data, shifting values (for offset columns),
@@ -124,6 +127,7 @@ struct dst_buf_info {
  * @param stride Size of the kernel block
  * @param value_shift Shift incoming 4-byte offset values down by this amount
  * @param bit_shift Shift incoming data right by this many bits
+ * @param valid_count Optional pointer to a value to store count of unset bits.
  */
 __device__ void copy_buffer(uint8_t* __restrict__ dst,
                             uint8_t* __restrict__ src,
@@ -133,9 +137,13 @@ __device__ void copy_buffer(uint8_t* __restrict__ dst,
                             int src_row_index,
                             uint32_t stride,
                             int value_shift,
-                            int bit_shift)
+                            int bit_shift,
+                            int num_rows,
+                            size_type *valid_count)
 {
   src += (src_row_index * element_size);
+
+  size_type thread_valid_count = 0;
 
   // handle misalignment. read 16 bytes in 4 byte reads. write in a single 16 byte store.
   const size_t num_bytes = num_elements * element_size;
@@ -158,31 +166,110 @@ __device__ void copy_buffer(uint8_t* __restrict__ dst,
     v.z -= value_shift;
     v.w -= value_shift;
     reinterpret_cast<uint4*>(dst)[pos / 16] = v;
+    if(valid_count){      
+      //printf("WRITE: %d\n", pos);
+      thread_valid_count += (__popc(v.x) + __popc(v.y) + __popc(v.z) + __popc(v.w));
+    }
     pos += stride;
   }
 
   // copy trailing bytes
   if (t == 0) {
-    size_t remainder = num_bytes < 16 ? num_bytes : 16 + (num_bytes % 16);
+    /*
+    size_t last_bracket = (num_bytes / 16) * 16;
+    size_t remainder = num_bytes - last_bracket;
+    if(remainder < 4){      
+      // we had less than 20 bytes for the last possible 16 byte copy, so copy 16 + the extra
+      remainder += 16;
+    }
+    */
+    size_t remainder;
+    if(num_bytes < 16){
+      remainder = num_bytes;
+    } else {
+      size_t last_bracket = (num_bytes / 16) * 16;
+      remainder = num_bytes - last_bracket;
+      if(remainder < 4){      
+        // we had less than 20 bytes for the last possible 16 byte copy, so copy 16 + the extra
+        remainder += 16;
+      }
+    }
+    //size_t remainder = num_bytes < 16 ? num_bytes : 
+                       //(num_bytes % 16) < 4 ? (num_bytes % 16) + 16 : 
+    // size_t remainder = (num_bytes % 20) - (num_bytes % 16);
+    //if(!valid_count){
+      //printf("Remainder: remainder(%lu) num_bytes(%lu), num_rows(%d)\n", remainder, num_bytes, num_rows);
+    //}
 
     // if we're performing a value shift (offsets), or a bit shift (validity) the # of bytes and
     // alignment must be a multiple of 4. value shifting and bit shifting are mututally exclusive
     // and will never both be true at the same time.
     if (value_shift || bit_shift) {
+      //if(num_bytes > 32){
+        //printf("A (%d)\n", num_bytes);
+      //}
       int idx    = (num_bytes - remainder) / 4;
       uint32_t v = remainder > 0 ? (reinterpret_cast<uint32_t*>(src)[idx] - value_shift) : 0;
       while (remainder) {
         uint32_t next =
           remainder > 0 ? (reinterpret_cast<uint32_t*>(src)[idx + 1] - value_shift) : 0;
-        reinterpret_cast<uint32_t*>(dst)[idx] = (v >> bit_shift) | (next << (32 - bit_shift));
+        
+        uint32_t val = (v >> bit_shift) | (next << (32 - bit_shift));
+        if(valid_count){
+//          printf("TAIL WRITE: %d\n", idx * 4);
+          thread_valid_count += __popc(val);
+        }
+        
+        reinterpret_cast<uint32_t*>(dst)[idx] = val;
         v                                     = next;
         idx++;
         remainder -= 4;
       }
     } else {
+      //if(num_bytes > 32){
+        //printf("B (%d)\n", num_bytes);
+      //}
       while (remainder) {
         int idx                              = num_bytes - remainder--;
-        reinterpret_cast<uint8_t*>(dst)[idx] = reinterpret_cast<uint8_t*>(src)[idx];
+        uint32_t val = reinterpret_cast<uint8_t*>(src)[idx];
+        if(valid_count){                              
+          thread_valid_count += __popc(val);
+          //if(num_bytes <= 32){
+            //printf("VVC: %d (0x%x)\n", thread_valid_count, val);
+          //}
+        }
+        reinterpret_cast<uint8_t*>(dst)[idx] = val;
+      }
+    }
+  }
+
+  if(valid_count){
+    if(num_bytes == 0){
+      if(!t){
+        *valid_count = 0;
+      }
+    } else {
+      using BlockReduce = cub::BlockReduce<size_type, copy_block_size>;
+      __shared__ typename BlockReduce::TempStorage temp_storage;
+      size_type block_valid_count{BlockReduce(temp_storage).Sum(thread_valid_count)};
+      if(!t){
+        // we may have copied more bits than there are actual rows in the output.
+        // so we need to subtract off the count of any bits that shouldn't have been
+        // considered during the copy step.
+        int max_row = (num_bytes * 8);
+        int slack_bits = max_row > num_rows ? max_row - num_rows : 0;
+        auto slack_mask = set_most_significant_bits(slack_bits);
+        if(slack_mask > 0){
+          uint32_t last_word = reinterpret_cast<uint32_t*>(dst + (num_bytes - 4))[0];
+          //if(num_bytes <= 32){
+            //printf("LR: vc(%d), max_row(%d), num_rows(%d), slack_bits(%d), slack_mask(0x%x), last_word(0x%x), masked(0x%x)\n", block_valid_count, max_row, num_rows, slack_bits, slack_mask, last_word, last_word & slack_mask);
+          //}
+          block_valid_count -= __popc(last_word & slack_mask);          
+        }        
+        //if(num_bytes <= 32){
+          //printf("VC: %d\n", block_valid_count);        
+        //}
+        *valid_count = block_valid_count;
       }
     }
   }
@@ -223,7 +310,9 @@ __global__ void copy_partition(int num_src_bufs,
               buf_info[buf_index].src_row_index,
               blockDim.x,
               buf_info[buf_index].value_shift,
-              buf_info[buf_index].bit_shift);
+              buf_info[buf_index].bit_shift, 
+              buf_info[buf_index].num_rows,
+              buf_info[buf_index].valid_count > 0 ? &buf_info[buf_index].valid_count : nullptr);
 }
 
 // The block of functions below are all related:
@@ -616,7 +705,8 @@ BufInfo build_output_columns(InputIter begin,
           current_info->num_elements == 0
             ? nullptr
             : reinterpret_cast<bitmask_type const*>(base_ptr + current_info->dst_offset);
-        auto const null_count = current_info->num_elements == 0 ? 0 : UNKNOWN_NULL_COUNT;
+        auto const null_count = current_info->num_elements == 0 ? 0 : (current_info->num_rows - current_info->valid_count);
+        // printf("Out null count : %d\n", null_count);
         ++current_info;
         return std::make_pair(ptr, null_count);
       }
@@ -878,6 +968,7 @@ std::vector<packed_table> contiguous_split(cudf::table_view const& input,
       }();
       int const element_size = cudf::type_dispatcher(data_type{src_info.type}, size_of_helper{});
       size_t const bytes     = num_elements * element_size;
+//       printf("num_rows : %d\n", num_rows);
       return dst_buf_info{_round_up_safe(bytes, 64),
                           num_elements,
                           element_size,
@@ -885,7 +976,8 @@ std::vector<packed_table> contiguous_split(cudf::table_view const& input,
                           out_row_index,
                           0,
                           value_shift,
-                          bit_shift};
+                          bit_shift,
+                          src_info.is_validity ? 1 : 0};
     });
 
   // compute total size of each partition
@@ -967,11 +1059,16 @@ std::vector<packed_table> contiguous_split(cudf::table_view const& input,
     d_src_bufs, h_src_bufs, src_bufs_size + dst_bufs_size, cudaMemcpyHostToDevice, stream.value()));
 
   // copy.  1 block per buffer
-  {
-    constexpr int block_size = 512;
-    copy_partition<<<num_bufs, block_size, 0, stream.value()>>>(
+  {    
+    copy_partition<<<num_bufs, copy_block_size, 0, stream.value()>>>(
       num_src_bufs, num_partitions, d_src_bufs, d_dst_bufs, d_dst_buf_info);
   }
+
+  // DtoH dst info (to retrieve null counts)
+  CUDA_TRY(cudaMemcpyAsync(
+    h_dst_buf_info, d_dst_buf_info, dst_buf_info_size, cudaMemcpyDeviceToHost, stream.value()));
+  
+  stream.synchronize();
 
   // build the output.
   std::vector<packed_table> result;
@@ -1000,7 +1097,7 @@ std::vector<packed_table> contiguous_split(cudf::table_view const& input,
   // we exit the function and our stack frame disappears. also of note : we're overlapping
   // construction of the output columns on the cpu while the data they point to is still being
   // copied. this can be a significant time savings.
-  stream.synchronize();
+  // stream.synchronize();
 
   return result;
 }
