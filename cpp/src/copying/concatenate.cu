@@ -376,9 +376,15 @@ void traverse_children::operator()<cudf::string_view>(host_span<column_view cons
       strings_column_view scv(b);
       return a + (b.is_empty()
                     ? 0
-                    : cudf::detail::get_value<offset_type>(
-                        scv.offsets(), scv.offset() + b.size(), stream) -
+                    /*
+                    : cudf::detail::get_value<offset_type>(scv.offsets(), scv.offset() + b.size(), stream) -
                         cudf::detail::get_value<offset_type>(scv.offsets(), scv.offset(), stream));
+                        */
+                    // if the column is unsliced, skip the offset retrieval.                    
+                    : scv.offset() > 0 ? 
+                        cudf::detail::get_value<offset_type>(scv.offsets(), scv.offset() + b.size(), stream) -
+                        cudf::detail::get_value<offset_type>(scv.offsets(), scv.offset(), stream)
+                          : scv.chars_size());
     });
   // note:  output text must include "exceeds size_type range" for python error handling
   CUDF_EXPECTS(total_char_count <= static_cast<size_t>(std::numeric_limits<size_type>::max()),
