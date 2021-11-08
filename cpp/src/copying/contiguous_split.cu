@@ -813,6 +813,18 @@ struct num_chunks_func {
   }
 };
 
+void print_commands(std::string const& title, dst_buf_info const* info, int num_infos)
+{
+  std::vector<dst_buf_info> h_info(num_infos);
+  cudaMemcpy(h_info.data(), info, sizeof(dst_buf_info) * num_infos, cudaMemcpyDeviceToHost);
+
+  printf("%s:\n", title.c_str());
+  printf("\tNum bufs:  %d\n", num_infos);
+  for(int idx=0; idx<num_infos; idx++){
+    printf("\t(%d): %lu bytes\n", idx, h_info[idx].buf_size);
+  }
+}
+
 #define __GPU
 #define __OPTIMIZED_PATH
 
@@ -831,18 +843,26 @@ void copy_data(size_t total_bytes, int num_bufs, int num_src_bufs, uint8_t const
   cudaGetDevice(&device);
   cudaDeviceProp prop;  
   cudaGetDeviceProperties(&prop, device);
+
+  //print_commands("Before", _d_dst_buf_info, num_bufs);
+
+  //printf("-------------------------\n");
+  //printf("Input buf count: %d\n", num_bufs);
+  //printf("Num SMs: %d\n", prop.multiProcessorCount);
   
   // distribute the # of chunks to be copied roughly evenly among the SMs we have
   rmm::device_uvector<thrust::pair<size_t, size_t>> chunks(num_bufs, stream);  
+
+  size_type const num_sms = prop.multiProcessorCount;
   
 #if defined(__GPU)
-  thrust::transform(rmm::exec_policy(stream), _d_dst_buf_info, _d_dst_buf_info + num_bufs, chunks.begin(), [total_bytes_f = static_cast<float>(total_bytes), num_sms = prop.multiProcessorCount]__device__(dst_buf_info const& buf){
+  thrust::transform(rmm::exec_policy(stream), _d_dst_buf_info, _d_dst_buf_info + num_bufs, chunks.begin(), [total_bytes_f = static_cast<float>(total_bytes), num_sms] __device__(dst_buf_info const& buf){
 #else
   std::vector<dst_buf_info> h_dst_buf_info(num_bufs);
   cudaMemcpy(h_dst_buf_info.data(), _d_dst_buf_info, sizeof(dst_buf_info) * num_bufs, cudaMemcpyDeviceToHost);
   std::vector<thrust::pair<size_t, size_t>> h_chunks;  
   float total_bytes_f = static_cast<float>(total_bytes);
-  size_type num_sms = prop.multiProcessorCount;
+  // size_type num_sms = prop.multiProcessorCount;
   for(size_t idx=0; idx<h_dst_buf_info.size(); idx++){
     dst_buf_info const& buf = h_dst_buf_info[idx];    
 #endif
@@ -862,7 +882,7 @@ void copy_data(size_t total_bytes, int num_bufs, int num_src_bufs, uint8_t const
     size_t const ideal_num_chunks = max(size_t{1}, static_cast<size_t>(fraction * num_sms)); // max(size_t{1}, min(bytes, static_cast<size_t>(fraction * num_sms)));
     
     // make sure chunks are padded/aligned to 64 bytes.
-    size_t const chunk_size = _round_up_safe(bytes / ideal_num_chunks, split_align);
+    size_t const chunk_size = max(size_t{split_align}, _round_up_safe(bytes / ideal_num_chunks, split_align));
     size_t const num_chunks = _round_up_safe(bytes, chunk_size) / chunk_size;
   #if defined(__GPU)
     return thrust::pair<size_t, size_t>{num_chunks, chunk_size};
@@ -895,7 +915,7 @@ void copy_data(size_t total_bytes, int num_bufs, int num_src_bufs, uint8_t const
 #if defined(__GPU)
   auto out_to_in_index = [chunk_offsets = chunk_offsets.begin(), num_bufs] __device__(size_type i){
 #else
-  auto out_to_in_index = [chunk_offsets = h_chunk_offsets.begin(), num_bufs] __device__(size_type i){
+  auto out_to_in_index = [chunk_offsets = h_chunk_offsets.begin(), num_bufs] __host__(size_type i){
 #endif
     return static_cast<size_type>(thrust::upper_bound(thrust::seq, chunk_offsets, chunk_offsets + num_bufs + 1, i) - chunk_offsets) - 1;
   };
@@ -903,10 +923,12 @@ void copy_data(size_t total_bytes, int num_bufs, int num_src_bufs, uint8_t const
   // apply the chunking.
   auto num_chunks = cudf::detail::make_counting_transform_iterator(0, num_chunks_func{chunks.begin()});
   size_type new_buf_count = thrust::reduce(rmm::exec_policy(stream), num_chunks, num_chunks + chunks.size());  
+  // new_buf_count = -1;
 #if defined(__GPU)
   //rmm::device_uvector<uint8_t const*> d_src_bufs(new_buf_count, rmm::cuda_stream_default);
   rmm::device_uvector<dst_buf_info> d_dst_buf_info(new_buf_count, stream);
   auto iter = thrust::make_counting_iterator(0);
+  // printf("new_buf_count:  %d\n", new_buf_count);
   thrust::for_each(rmm::exec_policy(stream), iter, iter + new_buf_count, [//_d_src_bufs,
                                                                           _d_dst_buf_info,
                                                                           // d_src_bufs = d_src_bufs.begin(),
@@ -969,6 +991,8 @@ void copy_data(size_t total_bytes, int num_bufs, int num_src_bufs, uint8_t const
   }
 #endif
 
+  //print_commands("After", d_dst_buf_info.begin(), (int)d_dst_buf_info.size());
+
   copy_partition<block_size><<<new_buf_count, block_size, 0, stream.value()>>>(
     num_src_bufs, d_src_bufs, d_dst_bufs, d_dst_buf_info.data());
     
@@ -978,6 +1002,7 @@ void copy_data(size_t total_bytes, int num_bufs, int num_src_bufs, uint8_t const
     num_bufs, d_src_bufs, d_dst_bufs, d_dst_buf_info);
     */
   CUDF_EXPECTS(new_buf_count >= num_bufs, "DOH");
+#if defined(__GPU)
   // postprocess valid_counts
   auto keys = cudf::detail::make_counting_transform_iterator(0, [out_to_in_index] __device__ (size_type i){
     return out_to_in_index(i);
@@ -987,6 +1012,7 @@ void copy_data(size_t total_bytes, int num_bufs, int num_src_bufs, uint8_t const
   });
   thrust::reduce_by_key(rmm::exec_policy(stream), keys, keys + new_buf_count, values, thrust::make_discard_iterator(), 
                         dst_valid_count_output_iterator{_d_dst_buf_info});
+#endif
 
   /*
   std::vector<dst_buf_info> a(d_dst_buf_info.size());
