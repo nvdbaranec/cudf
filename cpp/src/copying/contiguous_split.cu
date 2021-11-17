@@ -97,7 +97,7 @@ struct dst_buf_info {
   int num_rows;             // # of rows to be copied(which may be different from num_elements in the case of validity or
                             // offset buffers)    
 
-  int src_row_index;        // row index to start reading from from my associated source buffer
+  int src_element_index;    // element index to start reading from from my associated source buffer
   std::size_t dst_offset;   // my offset into the per-partition allocation  
   int value_shift;          // amount to shift values down by (for offset buffers)
   int bit_shift;            // # of bits to shift right by (for validity buffers)
@@ -129,7 +129,7 @@ struct dst_buf_info {
  * @param t Thread index
  * @param num_elements Number of elements to copy
  * @param element_size Size of each element in bytes
- * @param src_row_index Row index to start copying at
+ * @param src_element_index Element index to start copying at
  * @param stride Size of the kernel block
  * @param value_shift Shift incoming 4-byte offset values down by this amount
  * @param bit_shift Shift incoming data right by this many bits
@@ -142,14 +142,14 @@ __device__ void copy_buffer(uint8_t* __restrict__ dst,
                             int t,
                             std::size_t num_elements,
                             std::size_t element_size,
-                            std::size_t src_row_index,
+                            std::size_t src_element_index,
                             uint32_t stride,
                             int value_shift,
                             int bit_shift,
                             std::size_t num_rows,
                             size_type* valid_count)
 {
-  src += (src_row_index * element_size);
+  src += (src_element_index * element_size);
 
   size_type thread_valid_count = 0;
 
@@ -288,7 +288,7 @@ __global__ void copy_partition(int num_src_bufs,
     threadIdx.x,
     buf_info[buf_index].num_elements,
     buf_info[buf_index].element_size,
-    buf_info[buf_index].src_row_index,
+    buf_info[buf_index].src_element_index,
     blockDim.x,
     buf_info[buf_index].value_shift,
     buf_info[buf_index].bit_shift,
@@ -825,6 +825,7 @@ void print_commands(std::string const& title, dst_buf_info const* info, int num_
   }
 }
 
+
 #define __GPU
 #define __OPTIMIZED_PATH
 
@@ -968,7 +969,7 @@ void copy_data(size_t total_bytes, int num_bufs, int num_src_bufs, uint8_t const
     out.src_buf_index = in.src_buf_index;
     out.dst_buf_index = in.dst_buf_index;
           
-    size_type const elements_per_chunk = chunk_size / out.element_size;
+    size_type const elements_per_chunk = out.element_size == 0 ? 0 : chunk_size / out.element_size;
     out.num_elements = ((chunk_index + 1) * elements_per_chunk) > in.num_elements 
                               ? in.num_elements - (chunk_index * elements_per_chunk)
                               : elements_per_chunk;
@@ -978,13 +979,23 @@ void copy_data(size_t total_bytes, int num_bufs, int num_src_bufs, uint8_t const
                               ? in.num_rows - (chunk_index * rows_per_chunk)
                               : rows_per_chunk;
 
-    out.src_row_index = in.src_row_index + (chunk_index * rows_per_chunk);
+    // out.src_element_index = in.src_element_index + (chunk_index * elements_per_chunk);    
+    out.src_element_index = in.src_element_index + (chunk_index * elements_per_chunk);    
+    /*
+    if(in.valid_count && chunk_index > 0){
+      printf("V(%d): %d (%d)\n", chunk_index, out.src_element_index, in.src_element_index + (chunk_index * rows_per_chunk));
+    }
+    */
 
     out.dst_offset = in.dst_offset + (chunk_index * chunk_size);
 
+    // out.bytes is unneeded here because it is only used to calculate real output buffer sizes. what we 
+    // are generating here are not used for that calculation.
+    /*
     std::size_t const bytes =
         static_cast<std::size_t>(out.num_elements) * static_cast<std::size_t>(out.element_size);
     out.buf_size = _round_up_safe(bytes, split_align);
+    */
 #if defined(__GPU)
   });
 #else
@@ -1038,11 +1049,30 @@ void copy_data(size_t total_bytes, int num_bufs, int num_src_bufs, uint8_t const
 
 namespace detail {
 
+// static int call_count = 0;
+
 std::vector<packed_table> contiguous_split(cudf::table_view const& input,
                                            std::vector<size_type> const& splits,
                                            rmm::cuda_stream_view stream,
                                            rmm::mr::device_memory_resource* mr)
 {
+  /*
+   {
+    printf("CONTIG SPLIT (%lu)\n", splits.size());
+    printf("   ");
+    for(size_t idx=0; idx<splits.size(); idx++){
+      printf("%d ", splits[idx]);
+    }
+    printf("\n");
+
+    char filename[512];
+    sprintf(filename, "/home/dbaranec/projects/db_test/cs_debug/bad_in_%d.parquet", call_count);
+    cudf::io::parquet_writer_options opts =
+      cudf::io::parquet_writer_options::builder(cudf::io::sink_info{std::string{filename}}, input); 
+    cudf::io::write_parquet(opts);
+  }
+  */
+
   if (input.num_columns() == 0) { return {}; }
   if (splits.size() > 0) {
     CUDF_EXPECTS(splits.back() <= input.column(0).size(),
@@ -1057,7 +1087,7 @@ std::vector<packed_table> contiguous_split(cudf::table_view const& input,
       CUDF_EXPECTS(end <= input.column(0).size(), "Slice range out of bounds.");
       begin = end;
     }
-  }
+  }  
 
   std::size_t const num_partitions   = splits.size() + 1;
   std::size_t const num_root_columns = input.num_columns();
@@ -1205,8 +1235,8 @@ std::vector<packed_table> contiguous_split(cudf::table_view const& input,
         }
       }
 
-      // final row indices and row count
-      int const out_row_index = src_info.is_validity ? row_start / 32 : row_start;
+      // final element indices and row count
+      int const out_element_index = src_info.is_validity ? row_start / 32 : row_start;
       int const num_rows      = row_end - row_start;
       // if I am an offsets column, all my values need to be shifted
       int const value_shift = src_info.offsets == nullptr ? 0 : src_info.offsets[row_start];
@@ -1229,7 +1259,7 @@ std::vector<packed_table> contiguous_split(cudf::table_view const& input,
                           num_elements,
                           element_size,
                           num_rows,
-                          out_row_index,
+                          out_element_index,
                           0,
                           value_shift,
                           bit_shift,
@@ -1350,6 +1380,20 @@ std::vector<packed_table> contiguous_split(cudf::table_view const& input,
 
     cols.clear();
   }
+
+  /*
+  {        
+    for(size_t idx=0; idx<result.size(); idx++){
+      char filename[512];
+      sprintf(filename, "/home/dbaranec/projects/db_test/cs_debug/bad_out_%d_%lu.parquet", call_count, idx);
+      cudf::io::parquet_writer_options opts =
+        cudf::io::parquet_writer_options::builder(cudf::io::sink_info{std::string{filename}}, result[idx].table); 
+      cudf::io::write_parquet(opts);
+    }
+
+    call_count++;
+  }
+  */
 
   return result;
 }
