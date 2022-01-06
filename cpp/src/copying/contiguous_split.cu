@@ -824,14 +824,42 @@ void copy_data(size_t total_bytes,
   // our incoming dst_buf_info data is the exact description of what the output should look like.
   // let's do some examination of what's being copied and potentially break things up into
   // more pieces to parallelize better.
+  /*
   int device;
   cudaGetDevice(&device);
   cudaDeviceProp prop;
   cudaGetDeviceProperties(&prop, device);
+  */
 
   // distribute the # of chunks to be copied roughly evenly among the SMs we have
   rmm::device_uvector<thrust::pair<size_t, size_t>> chunks(num_bufs, stream);
 
+  // A: straight constant
+  auto const desired_chunk_size = size_t{1 * 1024 * 1024};
+
+  // B: larger multiple of SM count with uniform subdivision across all columns
+  //auto const num_sms = prop.multiProcessorCount * 8;
+  //auto const desired_chunk_size = max(size_t{256 * 1024}, util::round_up_safe(total_bytes / (num_sms), split_align));  
+
+  thrust::transform(
+    rmm::exec_policy(stream),
+    _d_dst_buf_info,
+    _d_dst_buf_info + num_bufs,
+    chunks.begin(),
+    [desired_chunk_size] __device__(dst_buf_info const& buf) {
+      // how many chunks do we want to subdivide this buffer into
+      size_t const bytes = buf.num_elements * buf.element_size;
+      
+      // can happen for things like lists and strings (the root columns store no data)
+      if (bytes == 0) { return thrust::pair<size_t, size_t>{1, 0}; }
+      size_t const num_chunks = max(size_t{1}, _round_up_safe(bytes, desired_chunk_size) / desired_chunk_size); 
+      
+      // NOTE: leaving chunk size as a separate parameter for future tuning possibilities,
+      // even though in the current implemenetation it will be a constant.
+      return thrust::pair<size_t, size_t>{num_chunks, desired_chunk_size};
+    });
+
+  #if 0
   auto const num_sms = prop.multiProcessorCount;
   thrust::transform(
     rmm::exec_policy(stream),
@@ -852,6 +880,7 @@ void copy_data(size_t total_bytes,
       size_t const num_chunks = _round_up_safe(bytes, chunk_size) / chunk_size;
       return thrust::pair<size_t, size_t>{num_chunks, chunk_size};
     });
+  #endif
 
   rmm::device_uvector<offset_type> chunk_offsets(num_bufs + 1, stream);
   auto buf_count_iter = cudf::detail::make_counting_transform_iterator(
@@ -1189,12 +1218,11 @@ std::vector<packed_table> contiguous_split(cudf::table_view const& input,
   // allocate output partition buffers
   std::vector<rmm::device_buffer> out_buffers;
   out_buffers.reserve(num_partitions);
-  size_t total_bytes = 0;
+  size_t total_bytes = std::reduce(h_buf_sizes, h_buf_sizes + num_partitions);
   std::transform(h_buf_sizes,
                  h_buf_sizes + num_partitions,
                  std::back_inserter(out_buffers),
-                 [stream, mr, &total_bytes](std::size_t bytes) {
-                   total_bytes += bytes;
+                 [stream, mr](std::size_t bytes) {
                    return rmm::device_buffer{bytes, stream, mr};
                  });
 
