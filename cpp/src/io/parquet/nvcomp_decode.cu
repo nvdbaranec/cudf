@@ -28,9 +28,6 @@
 
 #include <io/utilities/hostdevice_vector.hpp>
 
-#include <thrift/protocol/TCompactProtocol.h>
-#include <thrift/transport/TBufferTransports.h>
-
 #include <cub/cub.cuh>
 
 #include <fcntl.h>
