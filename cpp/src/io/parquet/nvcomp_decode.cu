@@ -769,7 +769,7 @@ std::pair<std::vector<cudf::size_type>, hostdevice_vector<cudf::size_type>> deco
 {
   const auto num_pages = pages.size();
 
-  printf("NVCOMP processing: %lu pages\n", pages.size());
+  // printf("NVCOMP processing: %lu pages\n", pages.size());
 
   // This test is necessary because thrust::raw_pointer_cast(X.data()) could lead to error if the
   // size is 0.

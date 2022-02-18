@@ -43,7 +43,7 @@
 #include <numeric>
 #include <regex>
 
-//#define __USE_NVCOMP_DECODE
+#define __USE_NVCOMP_DECODE
 // #define __TIMING_ENABLE
 
 #if defined(__TIMING_ENABLE)
@@ -1550,7 +1550,7 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
     // if we're using nvcomp decode, intercept whatever pages we can send down the fast path.
     #if defined(__USE_NVCOMP_DECODE)
     auto [pages, nvc_src_col_indices, nvc_null_counts] = experimental::parquet::decode_relevant_pages(chunks, _pages, stream);
-    printf("CUIO processing: %lu pages\n", pages.size());
+    // printf("CUIO processing: %lu pages\n", pages.size());
     #else
     hostdevice_vector<gpu::PageInfo>& pages = _pages;
     #endif
