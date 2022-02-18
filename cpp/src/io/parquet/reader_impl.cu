@@ -36,11 +36,20 @@
 #include <rmm/exec_policy.hpp>
 
 #include <nvcomp/snappy.h>
+#include "nvcomp_decode.hpp"
 
 #include <algorithm>
 #include <array>
 #include <numeric>
 #include <regex>
+
+//#define __USE_NVCOMP_DECODE
+// #define __TIMING_ENABLE
+
+#if defined(__TIMING_ENABLE)
+#include "db_test.cuh"
+#endif
+
 
 namespace cudf {
 namespace io {
@@ -1395,12 +1404,12 @@ void reader::impl::preprocess_columns(hostdevice_vector<gpu::ColumnChunkDesc>& c
  * @copydoc cudf::io::detail::parquet::decode_page_data
  */
 void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
-                                    hostdevice_vector<gpu::PageInfo>& pages,
+                                    hostdevice_vector<gpu::PageInfo>& _pages,
                                     hostdevice_vector<gpu::PageNestingInfo>& page_nesting,
                                     size_t min_row,
                                     size_t total_rows,
                                     rmm::cuda_stream_view stream)
-{
+{ 
   auto is_dict_chunk = [](const gpu::ColumnChunkDesc& chunk) {
     return (chunk.data_type & 0x7) == BYTE_ARRAY && chunk.num_dict_pages > 0;
   };
@@ -1409,7 +1418,14 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
   // NOTE: Assumes first page in the chunk is always the dictionary page
   size_t total_str_dict_indexes = 0;
   for (size_t c = 0, page_count = 0; c < chunks.size(); c++) {
-    if (is_dict_chunk(chunks[c])) { total_str_dict_indexes += pages[page_count].num_input_values; }
+    if (is_dict_chunk(chunks[c])) { total_str_dict_indexes += _pages[page_count].num_input_values; }
+    
+    // if this chunk contains dictionary encoding, store a pointer to the dictionary data for
+    // convenience in converting to the nvcomp path
+    if(chunks[c].num_dict_pages > 0){      
+      chunks[c].dict_data = _pages[page_count].page_data;
+    }
+
     page_count += chunks[c].max_num_pages;
   }
 
@@ -1442,8 +1458,8 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
 
     if (is_dict_chunk(chunks[c])) {
       chunks[c].str_dict_index = str_dict_index.data() + str_ofs;
-      str_ofs += pages[page_count].num_input_values;
-    }
+      str_ofs += _pages[page_count].num_input_values;
+    }    
 
     size_t max_depth = _metadata->get_output_nesting_depth(chunks[c].src_col_schema);
     chunk_offsets.push_back(chunk_off);
@@ -1506,11 +1522,16 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
         valids[idx] = nullptr;
         data[idx]   = nullptr;
       }
+
+      if(idx == 0){
+        chunks[c].valid_map_simple = valids[idx];
+        chunks[c].column_data_simple = data[idx];        
+      }
     }
 
     // column_data_base will always point to leaf data, even for nested types.
     page_count += chunks[c].max_num_pages;
-  }
+  }  
 
   chunks.host_to_device(stream);
   chunk_nested_valids.host_to_device(stream);
@@ -1520,7 +1541,30 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
     gpu::BuildStringDictionaryIndex(chunks.device_ptr(), chunks.size(), stream);
   }
 
-  gpu::DecodePageData(pages, chunks, total_rows, min_row, stream);
+  #if defined(__TIMING_ENABLE)
+  scope_timer_manual tm("decode");
+  stream.synchronize();
+  tm.start();
+  #endif
+
+    // if we're using nvcomp decode, intercept whatever pages we can send down the fast path.
+    #if defined(__USE_NVCOMP_DECODE)
+    auto [pages, nvc_src_col_indices, nvc_null_counts] = experimental::parquet::decode_relevant_pages(chunks, _pages, stream);
+    printf("CUIO processing: %lu pages\n", pages.size());
+    #else
+    hostdevice_vector<gpu::PageInfo>& pages = _pages;
+    #endif
+    
+    gpu::DecodePageData(pages, chunks, total_rows, min_row, stream);
+
+  #if defined(__TIMING_ENABLE)
+  stream.synchronize();
+  tm.end();
+  #endif
+
+  #if defined(__USE_NVCOMP_DECODE)
+  nvc_null_counts.device_to_host(stream);
+  #endif
   pages.device_to_host(stream);
   page_nesting.device_to_host(stream);
   stream.synchronize();
@@ -1576,10 +1620,20 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
       // if I wasn't the one who wrote out the validity bits, skip it
       if (chunk_nested_valids.host_ptr(chunk_offsets[pi->chunk_idx])[l_idx] == nullptr) {
         continue;
-      }
+      }      
       out_buf.null_count() += pni[l_idx].null_count;
-    }
+    }    
   }
+
+  // add null counts from pages decoded from nvcomp
+  #if defined(__USE_NVCOMP_DECODE)
+  for (size_t idx = 0; idx < nvc_src_col_indices.size(); idx++) {
+    input_column_info const& input_col = _input_columns[nvc_src_col_indices[idx]];
+    auto& out_buf = _output_columns[input_col.nesting[0]];
+    //printf("CU: %lu, %d, %d, %d (%d)\n", idx, nvc_src_col_indices[idx], input_col.nesting[0], nvc_null_counts[idx], out_buf.null_count());
+    out_buf.null_count() += nvc_null_counts[idx];
+  }
+  #endif
 
   stream.synchronize();
 }
@@ -1612,7 +1666,13 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                                        size_type num_rows,
                                        std::vector<std::vector<size_type>> const& row_group_list,
                                        rmm::cuda_stream_view stream)
-{
+{  
+  #if defined(__USE_NVCOMP_DECODE)
+  if(skip_rows != 0 || num_rows != -1){
+    CUDF_FAIL("This version of the cuIO parquet reader does not support user-supplied row bounds");
+  }
+  #endif
+
   // Select only row groups required
   const auto selected_row_groups =
     _metadata->select_row_groups(row_group_list, skip_rows, num_rows);

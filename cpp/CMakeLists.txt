@@ -304,6 +304,7 @@ add_library(
   src/io/parquet/compact_protocol_writer.cpp
   src/io/parquet/page_data.cu
   src/io/parquet/chunk_dict.cu
+  src/io/parquet/nvcomp_decode.cu
   src/io/parquet/page_enc.cu
   src/io/parquet/page_hdr.cu
   src/io/parquet/parquet.cpp

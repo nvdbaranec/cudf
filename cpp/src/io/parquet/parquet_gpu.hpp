@@ -71,7 +71,7 @@ using slot_type               = map_type::pair_atomic_type;
  * @brief Enums for the flags in the page header
  */
 enum {
-  PAGEINFO_FLAGS_DICTIONARY = (1 << 0),  // Indicates a dictionary page
+  PAGEINFO_FLAGS_DICTIONARY = (1 << 0),   // Indicates a dictionary page
 };
 
 /**
@@ -190,8 +190,11 @@ struct ColumnChunkDesc {
       max_num_pages(0),
       page_info(nullptr),
       str_dict_index(nullptr),
-      valid_map_base{nullptr},
+      valid_map_base{nullptr},      
       column_data_base{nullptr},
+      column_data_simple{nullptr},
+      valid_map_simple{nullptr},
+      dict_data{nullptr},
       codec(codec_),
       converted_type(converted_type_),
       decimal_scale(decimal_scale_),
@@ -217,9 +220,18 @@ struct ColumnChunkDesc {
   int32_t max_num_pages;                      // size of page_info array
   PageInfo* page_info;                        // output page info for up to num_dict_pages +
                                               // num_data_pages (dictionary pages first)
-  string_index_pair* str_dict_index;          // index for string dictionary
+  string_index_pair* str_dict_index;          // index for string dictionary  
   uint32_t** valid_map_base;                  // base pointers of valid bit map for this column
-  void** column_data_base;                    // base pointers of column data
+  void** column_data_base;                    // base pointers of column data  
+  
+  // minor hacks to speed up nvcomp path. pointers to the base data, validity and dictionary
+  // data for non-nested columns. since the enclosing struct (ColumnChunkDesc) will exist
+  // host-side, the code for converting cuIO pages to nvcomp pages can get these pointer s
+  // without needing cudaMemcpy calls.  
+  void* column_data_simple;                   
+  uint32_t* valid_map_simple;                 // minor hack to speed up nvcomp path
+  uint8_t* dict_data;
+
   int8_t codec;                               // compressed codec enum
   int8_t converted_type;                      // converted type enum
   int8_t decimal_scale;                       // decimal scale pow(10, -decimal_scale)
