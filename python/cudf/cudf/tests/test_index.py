@@ -1,4 +1,4 @@
-# Copyright (c) 2018-2021, NVIDIA CORPORATION.
+# Copyright (c) 2018-2022, NVIDIA CORPORATION.
 
 """
 Test related to Index
@@ -28,6 +28,8 @@ from cudf.testing._utils import (
     SIGNED_INTEGER_TYPES,
     SIGNED_TYPES,
     UNSIGNED_TYPES,
+    assert_column_memory_eq,
+    assert_column_memory_ne,
     assert_eq,
     assert_exceptions_equal,
 )
@@ -391,62 +393,12 @@ def test_index_copy_category(name, dtype, deep=True):
     ],
 )
 def test_index_copy_deep(idx, deep):
-    """Test if deep copy creates a new instance for device data.
-    The general criterion is to compare `Buffer.ptr` between two data objects.
-    Specifically for:
-        - CategoricalIndex, this applies to both `.codes` and `.categories`
-        - StringIndex, to every element in `._base_children`
-        - Others, to `.base_data`
-    No test is defined for RangeIndex.
-    """
+    """Test if deep copy creates a new instance for device data."""
     idx_copy = idx.copy(deep=deep)
-    same_ref = not deep
-    if isinstance(idx, cudf.CategoricalIndex):
-        assert (
-            idx._values.codes.base_data.ptr
-            == idx_copy._values.codes.base_data.ptr
-        ) == same_ref
-        if isinstance(
-            idx._values.categories, cudf.core.column.string.StringColumn
-        ):
-            children = idx._values.categories._base_children
-            copy_children = idx_copy._values.categories._base_children
-            assert all(
-                [
-                    (
-                        children[i].base_data.ptr
-                        == copy_children[i].base_data.ptr
-                    )
-                    == same_ref
-                    for i in range(len(children))
-                ]
-            )
-        elif isinstance(
-            idx._values.categories, cudf.core.column.numerical.NumericalColumn
-        ):
-            assert (
-                idx._values.categories.base_data.ptr
-                == idx_copy._values.categories.base_data.ptr
-            ) == same_ref
-    elif isinstance(idx, cudf.StringIndex):
-        children = idx._values._base_children
-        copy_children = idx_copy._values._base_children
-        assert all(
-            [
-                (
-                    (
-                        children[i].base_data.ptr
-                        == copy_children[i].base_data.ptr
-                    )
-                    == same_ref
-                )
-                for i in range(len(children))
-            ]
-        )
+    if not deep:
+        assert_column_memory_eq(idx._values, idx_copy._values)
     else:
-        assert (
-            idx._values.base_data.ptr == idx_copy._values.base_data.ptr
-        ) == same_ref
+        assert_column_memory_ne(idx._values, idx_copy._values)
 
 
 @pytest.mark.parametrize("idx", [[1, None, 3, None, 5]])
@@ -1614,111 +1566,6 @@ def test_interval_index_from_breaks(closed):
     assert_eq(pindex, gindex)
 
 
-@pytest.mark.parametrize("n", [0, 2, 5, 10, None])
-@pytest.mark.parametrize("frac", [0.1, 0.5, 1, 2, None])
-@pytest.mark.parametrize("replace", [True, False])
-def test_index_sample_basic(n, frac, replace):
-    psr = pd.Series([1, 2, 3, 4, 5])
-    gindex = cudf.Index(psr)
-    random_state = 0
-
-    try:
-        pout = psr.sample(
-            n=n, frac=frac, replace=replace, random_state=random_state
-        )
-    except BaseException:
-        assert_exceptions_equal(
-            lfunc=psr.sample,
-            rfunc=gindex.sample,
-            lfunc_args_and_kwargs=(
-                [],
-                {
-                    "n": n,
-                    "frac": frac,
-                    "replace": replace,
-                    "random_state": random_state,
-                },
-            ),
-            rfunc_args_and_kwargs=(
-                [],
-                {
-                    "n": n,
-                    "frac": frac,
-                    "replace": replace,
-                    "random_state": random_state,
-                },
-            ),
-        )
-    else:
-        gout = gindex.sample(
-            n=n, frac=frac, replace=replace, random_state=random_state
-        )
-
-        assert pout.shape == gout.shape
-
-
-@pytest.mark.parametrize("n", [2, 5, 10, None])
-@pytest.mark.parametrize("frac", [0.5, 1, 2, None])
-@pytest.mark.parametrize("replace", [True, False])
-@pytest.mark.parametrize("axis", [0, 1])
-def test_multiindex_sample_basic(n, frac, replace, axis):
-    # as we currently don't support column with same name
-    if axis == 1 and replace:
-        return
-    pdf = pd.DataFrame(
-        {
-            "a": [1, 2, 3, 4, 5],
-            "float": [0.05, 0.2, 0.3, 0.2, 0.25],
-            "int": [1, 3, 5, 4, 2],
-        },
-    )
-    mul_index = cudf.Index(cudf.from_pandas(pdf))
-    random_state = 0
-
-    try:
-        pout = pdf.sample(
-            n=n,
-            frac=frac,
-            replace=replace,
-            random_state=random_state,
-            axis=axis,
-        )
-    except BaseException:
-        assert_exceptions_equal(
-            lfunc=pdf.sample,
-            rfunc=mul_index.sample,
-            lfunc_args_and_kwargs=(
-                [],
-                {
-                    "n": n,
-                    "frac": frac,
-                    "replace": replace,
-                    "random_state": random_state,
-                    "axis": axis,
-                },
-            ),
-            rfunc_args_and_kwargs=(
-                [],
-                {
-                    "n": n,
-                    "frac": frac,
-                    "replace": replace,
-                    "random_state": random_state,
-                    "axis": axis,
-                },
-            ),
-        )
-    else:
-        gout = mul_index.sample(
-            n=n,
-            frac=frac,
-            replace=replace,
-            random_state=random_state,
-            axis=axis,
-        )
-        assert pout.shape == gout.shape
-
-
 @pytest.mark.parametrize(
     "data",
     [
@@ -2528,3 +2375,115 @@ def test_index_nan_as_null(data, nan_idx, NA_idx, nan_as_null):
 
     if NA_idx is not None:
         assert idx[NA_idx] is cudf.NA
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [],
+        pd.Series(
+            ["this", "is", None, "a", "test"], index=["a", "b", "c", "d", "e"]
+        ),
+        pd.Series([0, 15, 10], index=[0, None, 9]),
+        pd.Series(
+            range(25),
+            index=pd.date_range(
+                start="2019-01-01", end="2019-01-02", freq="H"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "values",
+    [
+        [],
+        ["this", "is"],
+        [0, 19, 13],
+        ["2019-01-01 04:00:00", "2019-01-01 06:00:00", "2018-03-02"],
+    ],
+)
+def test_isin_index(data, values):
+    psr = cudf.utils.utils._create_pandas_series(data=data)
+    gsr = cudf.Series.from_pandas(psr)
+
+    got = gsr.index.isin(values)
+    expected = psr.index.isin(values)
+
+    assert_eq(got, expected)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pd.MultiIndex.from_arrays(
+            [[1, 2, 3], ["red", "blue", "green"]], names=("number", "color")
+        ),
+        pd.MultiIndex.from_arrays([[], []], names=("number", "color")),
+        pd.MultiIndex.from_arrays(
+            [[1, 2, 3, 10, 100], ["red", "blue", "green", "pink", "white"]],
+            names=("number", "color"),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "values,level,err",
+    [
+        (["red", "orange", "yellow"], "color", None),
+        (["red", "white", "yellow"], "color", None),
+        ([0, 1, 2, 10, 11, 15], "number", None),
+        ([0, 1, 2, 10, 11, 15], None, TypeError),
+        (pd.Series([0, 1, 2, 10, 11, 15]), None, TypeError),
+        (pd.Index([0, 1, 2, 10, 11, 15]), None, TypeError),
+        (pd.Index([0, 1, 2, 8, 11, 15]), "number", None),
+        (pd.Index(["red", "white", "yellow"]), "color", None),
+        ([(1, "red"), (3, "red")], None, None),
+        (((1, "red"), (3, "red")), None, None),
+        (
+            pd.MultiIndex.from_arrays(
+                [[1, 2, 3], ["red", "blue", "green"]],
+                names=("number", "color"),
+            ),
+            None,
+            None,
+        ),
+        (
+            pd.MultiIndex.from_arrays([[], []], names=("number", "color")),
+            None,
+            None,
+        ),
+        (
+            pd.MultiIndex.from_arrays(
+                [
+                    [1, 2, 3, 10, 100],
+                    ["red", "blue", "green", "pink", "white"],
+                ],
+                names=("number", "color"),
+            ),
+            None,
+            None,
+        ),
+    ],
+)
+def test_isin_multiindex(data, values, level, err):
+    pmdx = data
+    gmdx = cudf.from_pandas(data)
+
+    if err is None:
+        expected = pmdx.isin(values, level=level)
+        if isinstance(values, pd.MultiIndex):
+            values = cudf.from_pandas(values)
+        got = gmdx.isin(values, level=level)
+
+        assert_eq(got, expected)
+    else:
+        assert_exceptions_equal(
+            lfunc=pmdx.isin,
+            rfunc=gmdx.isin,
+            lfunc_args_and_kwargs=([values], {"level": level}),
+            rfunc_args_and_kwargs=([values], {"level": level}),
+            check_exception_type=False,
+            expected_error_message=re.escape(
+                "values need to be a Multi-Index or set/list-like tuple "
+                "squences  when `level=None`."
+            ),
+        )

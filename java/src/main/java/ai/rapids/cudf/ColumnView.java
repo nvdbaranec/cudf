@@ -232,6 +232,14 @@ public class ColumnView implements AutoCloseable, BinaryOperable {
   }
 
   /**
+   * Get a ColumnView that is the offsets for this list.
+   */
+  ColumnView getListOffsetsView() {
+    assert(getType().equals(DType.LIST));
+    return new ColumnView(getListOffsetCvPointer(viewHandle));
+  }
+
+  /**
    * Gets the data buffer for the current column view (viewHandle).
    * If the type is LIST, STRUCT it returns null.
    * @return    If the type is LIST, STRUCT or data buffer is empty it returns null,
@@ -1497,6 +1505,91 @@ public class ColumnView implements AutoCloseable, BinaryOperable {
   }
 
   /**
+   * Do a segmented reduce where the offsets column indicates which groups in this to combine. The
+   * output type is the same as the input type.
+   * @param offsets an INT32 column with no nulls.
+   * @param aggregation the aggregation to do
+   * @return the result.
+   */
+  public ColumnVector segmentedReduce(ColumnView offsets, SegmentedReductionAggregation aggregation) {
+    return segmentedReduce(offsets, aggregation, NullPolicy.EXCLUDE, type);
+  }
+
+  /**
+   * Do a segmented reduce where the offsets column indicates which groups in this to combine.
+   * @param offsets an INT32 column with no nulls.
+   * @param aggregation the aggregation to do
+   * @param outType the output data type.
+   * @return the result.
+   */
+  public ColumnVector segmentedReduce(ColumnView offsets, SegmentedReductionAggregation aggregation,
+      DType outType) {
+    return segmentedReduce(offsets, aggregation, NullPolicy.EXCLUDE, outType);
+  }
+
+  /**
+   * Do a segmented reduce where the offsets column indicates which groups in this to combine.
+   * @param offsets an INT32 column with no nulls.
+   * @param aggregation the aggregation to do
+   * @param nullPolicy the null policy.
+   * @param outType the output data type.
+   * @return the result.
+   */
+  public ColumnVector segmentedReduce(ColumnView offsets, SegmentedReductionAggregation aggregation,
+      NullPolicy nullPolicy, DType outType) {
+    long nativeId = aggregation.createNativeInstance();
+    try {
+      return new ColumnVector(segmentedReduce(getNativeView(), offsets.getNativeView(), nativeId,
+          nullPolicy.includeNulls, outType.typeId.getNativeId(), outType.getScale()));
+    } finally {
+      Aggregation.close(nativeId);
+    }
+  }
+
+  /**
+   * Do a reduction on the values in a list. The output type will be the type of the data column
+   * of this list.
+   * @param aggregation the aggregation to perform
+   */
+  public ColumnVector listReduce(SegmentedReductionAggregation aggregation) {
+    if (!getType().equals(DType.LIST)) {
+      throw new IllegalArgumentException("listReduce only works on list types");
+    }
+    try (ColumnView offsets = getListOffsetsView();
+         ColumnView data = getChildColumnView(0)) {
+      return data.segmentedReduce(offsets, aggregation);
+    }
+  }
+
+  /**
+   * Do a reduction on the values in a list.
+   * @param aggregation the aggregation to perform
+   * @param outType the type of the output. Typically, this should match with the child type
+   *                of the list.
+   */
+  public ColumnVector listReduce(SegmentedReductionAggregation aggregation, DType outType) {
+    return listReduce(aggregation, NullPolicy.EXCLUDE, outType);
+  }
+
+  /**
+   * Do a reduction on the values in a list.
+   * @param aggregation the aggregation to perform
+   * @param nullPolicy should nulls be included or excluded from the aggregation.
+   * @param outType the type of the output. Typically, this should match with the child type
+   *                of the list.
+   */
+  public ColumnVector listReduce(SegmentedReductionAggregation aggregation, NullPolicy nullPolicy,
+      DType outType) {
+    if (!getType().equals(DType.LIST)) {
+      throw new IllegalArgumentException("listReduce only works on list types");
+    }
+    try (ColumnView offsets = getListOffsetsView();
+         ColumnView data = getChildColumnView(0)) {
+      return data.segmentedReduce(offsets, aggregation, nullPolicy, outType);
+    }
+  }
+
+  /**
    * Calculate various percentiles of this ColumnVector, which must contain centroids produced by
    * a t-digest aggregation.
    *
@@ -2258,6 +2351,25 @@ public class ColumnView implements AutoCloseable, BinaryOperable {
   public final ColumnVector extractListElement(int index) {
     assert type.equals(DType.LIST) : "A column of type LIST is required for .extractListElement()";
     return new ColumnVector(extractListElement(getNativeView(), index));
+  }
+
+  /**
+   * For each list in this column pull out the entry at the corresponding index specified in
+   * the index column. If the entry goes off the end of the list a NULL is returned instead.
+   *
+   * The index column should have the same row count with the list column.
+   *
+   * @param indices a column of 0 based offsets into the list. Negative values go backwards from
+   *                the end of the list.
+   * @return a new column of the values at those indexes.
+   */
+  public final ColumnVector extractListElement(ColumnView indices) {
+    assert type.equals(DType.LIST) : "A column of type LIST is required for .extractListElement()";
+    assert indices != null && DType.INT32.equals(indices.type)
+        : "indices should be non-null and integer type";
+    assert indices.getRowCount() == rows
+        : "indices must have the same row count with list column";
+    return new ColumnVector(extractListElementV(getNativeView(), indices.getNativeView()));
   }
 
   /**
@@ -3132,17 +3244,23 @@ public class ColumnView implements AutoCloseable, BinaryOperable {
     return new ColumnVector(urlEncode(getNativeView()));
   }
 
-  /** For a column of type List<Struct<String, String>> and a passed in String key, return a string column
-   * for all the values in the struct that match the key, null otherwise.
-   * @param key the String scalar to lookup in the column
-   * @return a string column of values or nulls based on the lookup result
+  private static void assertIsSupportedMapKeyType(DType keyType) {
+    boolean isSupportedKeyType = 
+      !keyType.equals(DType.EMPTY) && !keyType.equals(DType.LIST) && !keyType.equals(DType.STRUCT);
+    assert isSupportedKeyType : "Map lookup by STRUCT and LIST keys is not supported.";
+  }
+
+  /** 
+   * Given a column of type List<Struct<X, Y>> and a key of type X, return a column of type Y,
+   * where each row in the output column is the Y value corresponding to the X key.
+   * If the key is not found, the corresponding output value is null.
+   * @param key the scalar key to lookup in the column
+   * @return a column of values or nulls based on the lookup result
    */
   public final ColumnVector getMapValue(Scalar key) {
-
     assert type.equals(DType.LIST) : "column type must be a LIST";
-    assert key != null : "target string may not be null";
-    assert key.getType().equals(DType.STRING) : "target string must be a string scalar";
-
+    assert key != null : "Lookup key may not be null";
+    assertIsSupportedMapKeyType(key.getType());
     return new ColumnVector(mapLookup(getNativeView(), key.getScalarHandle()));
   }
 
@@ -3154,9 +3272,8 @@ public class ColumnView implements AutoCloseable, BinaryOperable {
    */
   public final ColumnVector getMapKeyExistence(Scalar key) {
     assert type.equals(DType.LIST) : "column type must be a LIST";
-    assert key != null : "target string may not be null";
-    assert key.getType().equals(DType.STRING) : "target must be a string scalar";
-
+    assert key != null : "Lookup key may not be null";
+    assertIsSupportedMapKeyType(key.getType());
     return new ColumnVector(mapContains(getNativeView(), key.getScalarHandle()));
   }
 
@@ -3752,6 +3869,8 @@ public class ColumnView implements AutoCloseable, BinaryOperable {
 
   private static native long extractListElement(long nativeView, int index);
 
+  private static native long extractListElementV(long nativeView, long indicesView);
+
   private static native long dropListDuplicates(long nativeView);
 
   private static native long dropListDuplicatesWithKeysValues(long nativeHandle);
@@ -3875,6 +3994,9 @@ public class ColumnView implements AutoCloseable, BinaryOperable {
   private static native long ifElseSS(long predVec, long trueScalar, long falseScalar) throws CudfException;
 
   private static native long reduce(long viewHandle, long aggregation, int dtype, int scale) throws CudfException;
+
+  private static native long segmentedReduce(long dataViewHandle, long offsetsViewHandle,
+      long aggregation, boolean includeNulls, int dtype, int scale) throws CudfException;
 
   private static native long isNullNative(long viewHandle);
 
@@ -4002,6 +4124,8 @@ public class ColumnView implements AutoCloseable, BinaryOperable {
 
 
   static native long getChildCvPointer(long viewHandle, int childIndex) throws CudfException;
+
+  private static native long getListOffsetCvPointer(long viewHandle) throws CudfException;
 
   static native int getNativeNumChildren(long viewHandle) throws CudfException;
 
