@@ -48,9 +48,12 @@
 
 #define __USE_NVCOMP_DECODE
 // #define __TIMING_ENABLE
+#if defined(__USE_NVCOMP_DECODE)
+bool Use_nvcomp_decode = true;
+#endif
 
 #if defined(__TIMING_ENABLE)
-#include "db_test.cuh"
+#include "../../../../../../db_test/db_test_timer.hpp"
 #endif
 
 
@@ -1591,13 +1594,22 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
 
     // if we're using nvcomp decode, intercept whatever pages we can send down the fast path.
     #if defined(__USE_NVCOMP_DECODE)
-    auto [pages, nvc_src_col_indices, nvc_null_counts] = experimental::parquet::decode_relevant_pages(chunks, _pages, stream);
+    hostdevice_vector<cudf::io::parquet::gpu::PageInfo> nvc_pages;
+    std::vector<cudf::size_type> nvc_src_col_indices;
+    hostdevice_vector<cudf::size_type> nvc_null_counts;
+    if(Use_nvcomp_decode){
+      std::tie(nvc_pages, nvc_src_col_indices, nvc_null_counts) = experimental::parquet::decode_relevant_pages(chunks, _pages, stream);
+    }
+    hostdevice_vector<gpu::PageInfo>& pages = Use_nvcomp_decode ? nvc_pages : _pages;
+    // auto [pages, nvc_src_col_indices, nvc_null_counts] = experimental::parquet::decode_relevant_pages(chunks, _pages, stream);
     // printf("CUIO processing: %lu pages\n", pages.size());
     #else
     hostdevice_vector<gpu::PageInfo>& pages = _pages;
     #endif
     
-    gpu::DecodePageData(pages, chunks, total_rows, min_row, stream);
+    if(pages.size() > 0){
+      gpu::DecodePageData(pages, chunks, total_rows, min_row, stream);
+    }
 
   #if defined(__TIMING_ENABLE)
   stream.synchronize();
@@ -1605,7 +1617,9 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
   #endif
 
   #if defined(__USE_NVCOMP_DECODE)
-  nvc_null_counts.device_to_host(stream);
+  if(Use_nvcomp_decode){
+    nvc_null_counts.device_to_host(stream);
+  }
   #endif
   pages.device_to_host(stream);
   page_nesting.device_to_host(stream);
@@ -1669,11 +1683,13 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
 
   // add null counts from pages decoded from nvcomp
   #if defined(__USE_NVCOMP_DECODE)
-  for (size_t idx = 0; idx < nvc_src_col_indices.size(); idx++) {
-    input_column_info const& input_col = _input_columns[nvc_src_col_indices[idx]];
-    auto& out_buf = _output_columns[input_col.nesting[0]];
-    //printf("CU: %lu, %d, %d, %d (%d)\n", idx, nvc_src_col_indices[idx], input_col.nesting[0], nvc_null_counts[idx], out_buf.null_count());
-    out_buf.null_count() += nvc_null_counts[idx];
+  if(Use_nvcomp_decode){
+    for (size_t idx = 0; idx < nvc_src_col_indices.size(); idx++) {
+      input_column_info const& input_col = _input_columns[nvc_src_col_indices[idx]];
+      auto& out_buf = _output_columns[input_col.nesting[0]];
+      //printf("CU: %lu, %d, %d, %d (%d)\n", idx, nvc_src_col_indices[idx], input_col.nesting[0], nvc_null_counts[idx], out_buf.null_count());
+      out_buf.null_count() += nvc_null_counts[idx];
+    }
   }
   #endif
 
