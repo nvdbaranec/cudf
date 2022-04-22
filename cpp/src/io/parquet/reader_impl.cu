@@ -42,6 +42,11 @@
 #include <nvcomp/snappy.h>
 #include "nvcomp_decode.hpp"
 
+#include <thrust/for_each.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/transform.h>
+#include <thrust/tuple.h>
+
 #include <algorithm>
 #include <array>
 #include <numeric>
@@ -1187,6 +1192,19 @@ rmm::device_buffer reader::impl::decompress_page_data(
                                     codec_stats{parquet::SNAPPY, 0, 0},
                                     codec_stats{parquet::BROTLI, 0, 0}};
 
+  auto is_codec_supported = [&codecs](int8_t codec) {
+    if (codec == parquet::UNCOMPRESSED) return true;
+    return std::find_if(codecs.begin(), codecs.end(), [codec](auto& cstats) {
+             return codec == cstats.compression_type;
+           }) != codecs.end();
+  };
+  CUDF_EXPECTS(std::all_of(chunks.begin(),
+                           chunks.end(),
+                           [&is_codec_supported](auto const& chunk) {
+                             return is_codec_supported(chunk.codec);
+                           }),
+               "Unsupported compression type");
+
   for (auto& codec : codecs) {
     for_each_codec_page(codec.compression_type, [&](size_t page) {
       auto page_uncomp_size = pages[page].uncompressed_page_size;
@@ -1234,24 +1252,24 @@ rmm::device_buffer reader::impl::decompress_page_data(
         argc++;
       });
 
-      CUDA_TRY(cudaMemcpyAsync(inflate_in.device_ptr(start_pos),
-                               inflate_in.host_ptr(start_pos),
-                               sizeof(decltype(inflate_in)::value_type) * (argc - start_pos),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
-      CUDA_TRY(cudaMemcpyAsync(inflate_out.device_ptr(start_pos),
-                               inflate_out.host_ptr(start_pos),
-                               sizeof(decltype(inflate_out)::value_type) * (argc - start_pos),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(inflate_in.device_ptr(start_pos),
+                                    inflate_in.host_ptr(start_pos),
+                                    sizeof(decltype(inflate_in)::value_type) * (argc - start_pos),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(inflate_out.device_ptr(start_pos),
+                                    inflate_out.host_ptr(start_pos),
+                                    sizeof(decltype(inflate_out)::value_type) * (argc - start_pos),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
 
       switch (codec.compression_type) {
         case parquet::GZIP:
-          CUDA_TRY(gpuinflate(inflate_in.device_ptr(start_pos),
-                              inflate_out.device_ptr(start_pos),
-                              argc - start_pos,
-                              1,
-                              stream))
+          CUDF_CUDA_TRY(gpuinflate(inflate_in.device_ptr(start_pos),
+                                   inflate_out.device_ptr(start_pos),
+                                   argc - start_pos,
+                                   1,
+                                   stream))
           break;
         case parquet::SNAPPY:
           if (nvcomp_integration::is_stable_enabled()) {
@@ -1260,27 +1278,27 @@ rmm::device_buffer reader::impl::decompress_page_data(
                               codec.max_decompressed_size,
                               stream);
           } else {
-            CUDA_TRY(gpu_unsnap(inflate_in.device_ptr(start_pos),
-                                inflate_out.device_ptr(start_pos),
-                                argc - start_pos,
-                                stream));
+            CUDF_CUDA_TRY(gpu_unsnap(inflate_in.device_ptr(start_pos),
+                                     inflate_out.device_ptr(start_pos),
+                                     argc - start_pos,
+                                     stream));
           }
           break;
         case parquet::BROTLI:
-          CUDA_TRY(gpu_debrotli(inflate_in.device_ptr(start_pos),
-                                inflate_out.device_ptr(start_pos),
-                                debrotli_scratch.data(),
-                                debrotli_scratch.size(),
-                                argc - start_pos,
-                                stream));
+          CUDF_CUDA_TRY(gpu_debrotli(inflate_in.device_ptr(start_pos),
+                                     inflate_out.device_ptr(start_pos),
+                                     debrotli_scratch.data(),
+                                     debrotli_scratch.size(),
+                                     argc - start_pos,
+                                     stream));
           break;
         default: CUDF_FAIL("Unexpected decompression dispatch"); break;
       }
-      CUDA_TRY(cudaMemcpyAsync(inflate_out.host_ptr(start_pos),
-                               inflate_out.device_ptr(start_pos),
-                               sizeof(decltype(inflate_out)::value_type) * (argc - start_pos),
-                               cudaMemcpyDeviceToHost,
-                               stream.value()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(inflate_out.host_ptr(start_pos),
+                                    inflate_out.device_ptr(start_pos),
+                                    sizeof(decltype(inflate_out)::value_type) * (argc - start_pos),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.value()));
     }
   }
 

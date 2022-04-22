@@ -37,7 +37,6 @@ from cudf.api.types import (
 from cudf.core.buffer import Buffer
 from cudf.core.column import column, datetime
 from cudf.core.column.methods import ColumnMethods, ParentType
-from cudf.utils import utils
 from cudf.utils.docutils import copy_docstring
 from cudf.utils.dtypes import can_convert_to_column
 
@@ -365,9 +364,7 @@ class StringMethods(ColumnMethods):
             other_cols = _get_cols_list(self._parent, others)
             all_cols = [self._column] + other_cols
             data = libstrings.concatenate(
-                cudf.DataFrame(
-                    {index: value for index, value in enumerate(all_cols)}
-                ),
+                all_cols,
                 cudf.Scalar(sep),
                 cudf.Scalar(na_rep, "str"),
             )
@@ -2006,7 +2003,9 @@ class StringMethods(ColumnMethods):
             repl = ""
 
         return self._return_or_inplace(
-            libstrings.filter_alphanum(self._column, cudf.Scalar(repl), keep),
+            libstrings.filter_alphanum(
+                self._column, cudf.Scalar(repl, "str"), keep
+            ),
         )
 
     def slice_from(
@@ -2141,7 +2140,7 @@ class StringMethods(ColumnMethods):
 
         return self._return_or_inplace(
             libstrings.slice_replace(
-                self._column, start, stop, cudf.Scalar(repl)
+                self._column, start, stop, cudf.Scalar(repl, "str")
             ),
         )
 
@@ -2192,7 +2191,7 @@ class StringMethods(ColumnMethods):
             repl = ""
 
         return self._return_or_inplace(
-            libstrings.insert(self._column, start, cudf.Scalar(repl)),
+            libstrings.insert(self._column, start, cudf.Scalar(repl, "str")),
         )
 
     def get(self, i: int = 0) -> SeriesOrIndex:
@@ -2643,7 +2642,7 @@ class StringMethods(ColumnMethods):
                 )
             else:
                 result_table = libstrings.rsplit_record(
-                    self._column, cudf.Scalar(pat), n
+                    self._column, cudf.Scalar(pat, "str"), n
                 )
 
         return self._return_or_inplace(result_table, expand=expand)
@@ -2726,7 +2725,7 @@ class StringMethods(ColumnMethods):
 
         return self._return_or_inplace(
             cudf.core.frame.Frame(
-                *libstrings.partition(self._column, cudf.Scalar(sep))
+                *libstrings.partition(self._column, cudf.Scalar(sep, "str"))
             ),
             expand=expand,
         )
@@ -2793,7 +2792,7 @@ class StringMethods(ColumnMethods):
 
         return self._return_or_inplace(
             cudf.core.frame.Frame(
-                *libstrings.rpartition(self._column, cudf.Scalar(sep))
+                *libstrings.rpartition(self._column, cudf.Scalar(sep, "str"))
             ),
             expand=expand,
         )
@@ -3194,7 +3193,7 @@ class StringMethods(ColumnMethods):
             to_strip = ""
 
         return self._return_or_inplace(
-            libstrings.strip(self._column, cudf.Scalar(to_strip))
+            libstrings.strip(self._column, cudf.Scalar(to_strip, "str"))
         )
 
     def lstrip(self, to_strip: str = None) -> SeriesOrIndex:
@@ -3241,7 +3240,7 @@ class StringMethods(ColumnMethods):
             to_strip = ""
 
         return self._return_or_inplace(
-            libstrings.lstrip(self._column, cudf.Scalar(to_strip))
+            libstrings.lstrip(self._column, cudf.Scalar(to_strip, "str"))
         )
 
     def rstrip(self, to_strip: str = None) -> SeriesOrIndex:
@@ -3296,7 +3295,7 @@ class StringMethods(ColumnMethods):
             to_strip = ""
 
         return self._return_or_inplace(
-            libstrings.rstrip(self._column, cudf.Scalar(to_strip))
+            libstrings.rstrip(self._column, cudf.Scalar(to_strip, "str"))
         )
 
     def wrap(self, width: int, **kwargs) -> SeriesOrIndex:
@@ -4245,7 +4244,7 @@ class StringMethods(ColumnMethods):
         table = str.maketrans(table)
         return self._return_or_inplace(
             libstrings.filter_characters(
-                self._column, table, keep, cudf.Scalar(repl)
+                self._column, table, keep, cudf.Scalar(repl, "str")
             ),
         )
 
@@ -5205,7 +5204,7 @@ class StringColumn(column.ColumnBase):
                 result_col,
                 sep=cudf.Scalar(""),
                 na_rep=cudf.Scalar(None, "str"),
-            )[0]
+            ).element_indexing(0)
         else:
             return result_col
 
@@ -5432,7 +5431,11 @@ class StringColumn(column.ColumnBase):
         )
         df = df.drop_duplicates(subset=["old"], keep="last", ignore_index=True)
         if df._data["old"].null_count == 1:
-            res = self.fillna(df._data["new"][df._data["old"].isnull()][0])
+            res = self.fillna(
+                df._data["new"]
+                .apply_boolean_mask(df._data["old"].isnull())
+                .element_indexing(0)
+            )
             df = df.dropna(subset=["old"])
         else:
             res = self
@@ -5517,15 +5520,21 @@ class StringColumn(column.ColumnBase):
         if isinstance(other, (StringColumn, str, cudf.Scalar)):
             if op == "__add__":
                 if isinstance(other, cudf.Scalar):
-                    other = utils.scalar_broadcast_to(
-                        other, size=len(self), dtype="object"
+                    other = cast(
+                        StringColumn,
+                        column.full(len(self), other, dtype="object"),
                     )
+
+                # Explicit types are necessary because mypy infers ColumnBase
+                # rather than StringColumn and sometimes forgets Scalar.
+                lhs: Union[cudf.Scalar, StringColumn]
+                rhs: Union[cudf.Scalar, StringColumn]
                 lhs, rhs = (other, self) if reflect else (self, other)
 
                 return cast(
                     "column.ColumnBase",
                     libstrings.concatenate(
-                        cudf.DataFrame._from_data(data={0: lhs, 1: rhs}),
+                        [lhs, rhs],
                         sep=cudf.Scalar(""),
                         na_rep=cudf.Scalar(None, "str"),
                     ),

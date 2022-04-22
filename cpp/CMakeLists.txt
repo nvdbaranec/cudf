@@ -155,6 +155,23 @@ include(cmake/thirdparty/get_gtest.cmake)
 include(cmake/Modules/JitifyPreprocessKernels.cmake)
 # find cuFile
 include(cmake/Modules/FindcuFile.cmake)
+# find KvikIO
+include(cmake/thirdparty/get_kvikio.cmake)
+
+# Workaround until https://github.com/rapidsai/rapids-cmake/issues/176 is resolved
+if(NOT BUILD_SHARED_LIBS)
+  include("${rapids-cmake-dir}/export/find_package_file.cmake")
+  list(APPEND METADATA_KINDS BUILD INSTALL)
+  foreach(METADATA_KIND IN LISTS METADATA_KINDS)
+    rapids_export_find_package_file(
+      ${METADATA_KIND} "${CUDF_SOURCE_DIR}/cmake/Modules/FindcuFile.cmake" cudf-exports
+    )
+    rapids_export_package(${METADATA_KIND} cuco cudf-exports)
+    rapids_export_package(${METADATA_KIND} ZLIB cudf-exports)
+    rapids_export_package(${METADATA_KIND} cuFile cudf-exports)
+    rapids_export_package(${METADATA_KIND} nvcomp cudf-exports)
+  endforeach()
+endif()
 
 # ##################################################################################################
 # * library targets -------------------------------------------------------------------------------
@@ -330,10 +347,12 @@ add_library(
   src/join/join.cu
   src/join/join_utils.cu
   src/join/mixed_join.cu
-  src/join/mixed_join_kernels.cu
+  src/join/mixed_join_kernel.cu
+  src/join/mixed_join_kernel_nulls.cu
   src/join/mixed_join_kernels_semi.cu
   src/join/mixed_join_semi.cu
-  src/join/mixed_join_size_kernels.cu
+  src/join/mixed_join_size_kernel.cu
+  src/join/mixed_join_size_kernel_nulls.cu
   src/join/mixed_join_size_kernels_semi.cu
   src/join/semi_join.cu
   src/lists/contains.cu
@@ -570,7 +589,7 @@ add_dependencies(cudf jitify_preprocess_run)
 target_link_libraries(
   cudf
   PUBLIC ${ARROW_LIBRARIES} libcudacxx::libcudacxx cudf::Thrust rmm::rmm
-  PRIVATE cuco::cuco ZLIB::ZLIB nvcomp::nvcomp
+  PRIVATE cuco::cuco ZLIB::ZLIB nvcomp::nvcomp kvikio::kvikio
 )
 
 # Add Conda library, and include paths if specified
