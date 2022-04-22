@@ -294,7 +294,8 @@ std::tuple<hostdevice_vector<cudf::io::parquet::gpu::PageInfo>,
            hostdevice_vector<cudf::size_type>>
 decode_relevant_pages(hostdevice_vector<cudf::io::parquet::gpu::ColumnChunkDesc>& chunks,
                       hostdevice_vector<cudf::io::parquet::gpu::PageInfo>& _pages,
-                      rmm::cuda_stream_view stream);
+                      rmm::cuda_stream_view stream,
+                      rmm::cuda_stream_view return_stream);
 
 }   // namespace parquet
 

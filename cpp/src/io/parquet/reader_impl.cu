@@ -33,6 +33,7 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
@@ -1469,6 +1470,7 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
     // convenience in converting to the nvcomp path
     if(chunks[c].num_dict_pages > 0){      
       chunks[c].dict_data = _pages[page_count].page_data;
+      chunks[c].dict_page_index = page_count;
     }
 
     page_count += chunks[c].max_num_pages;
@@ -1586,44 +1588,59 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
     gpu::BuildStringDictionaryIndex(chunks.device_ptr(), chunks.size(), stream);
   }
 
+  // static thread_local rmm::cuda_stream nvcomp_stream;    
+  #if defined(__USE_NVCOMP_DECODE)
+  static thread_local cudaStream_t* _nvcomp_stream = nullptr;
+  static thread_local rmm::cuda_stream_view nvcomp_stream;
+  if(_nvcomp_stream == nullptr){
+    _nvcomp_stream = new cudaStream_t;
+    RMM_CUDA_TRY(cudaStreamCreateWithFlags(_nvcomp_stream, cudaStreamNonBlocking));
+
+    nvcomp_stream = rmm::cuda_stream_view(*_nvcomp_stream);
+  }
+  #endif
+
   #if defined(__TIMING_ENABLE)
   scope_timer_manual tm("decode");
   stream.synchronize();
+  nvcomp_stream.synchronize();
   tm.start();
-  #endif
+  #endif  
 
     // if we're using nvcomp decode, intercept whatever pages we can send down the fast path.
     #if defined(__USE_NVCOMP_DECODE)
-    hostdevice_vector<cudf::io::parquet::gpu::PageInfo> nvc_pages;
+    hostdevice_vector<cudf::io::parquet::gpu::PageInfo> remainder_pages;
     std::vector<cudf::size_type> nvc_src_col_indices;
     hostdevice_vector<cudf::size_type> nvc_null_counts;
     if(Use_nvcomp_decode){
-      std::tie(nvc_pages, nvc_src_col_indices, nvc_null_counts) = experimental::parquet::decode_relevant_pages(chunks, _pages, stream);
+      std::tie(remainder_pages, nvc_src_col_indices, nvc_null_counts) = experimental::parquet::decode_relevant_pages(chunks, _pages, nvcomp_stream, stream);
     }
-    hostdevice_vector<gpu::PageInfo>& pages = Use_nvcomp_decode ? nvc_pages : _pages;
-    // auto [pages, nvc_src_col_indices, nvc_null_counts] = experimental::parquet::decode_relevant_pages(chunks, _pages, stream);
-    // printf("CUIO processing: %lu pages\n", pages.size());
+    hostdevice_vector<gpu::PageInfo>& pages = Use_nvcomp_decode ? remainder_pages : _pages;
     #else
     hostdevice_vector<gpu::PageInfo>& pages = _pages;
     #endif
     
-    if(pages.size() > 0){
+    if(pages.size() > 0){      
       gpu::DecodePageData(pages, chunks, total_rows, min_row, stream);
     }
 
   #if defined(__TIMING_ENABLE)
   stream.synchronize();
+  nvcomp_stream.synchronize();  
   tm.end();
-  #endif
+  #endif  
 
   #if defined(__USE_NVCOMP_DECODE)
-  if(Use_nvcomp_decode){
-    nvc_null_counts.device_to_host(stream);
+  if(Use_nvcomp_decode){    
+    nvc_null_counts.device_to_host(nvcomp_stream);    
   }
   #endif
   pages.device_to_host(stream);
   page_nesting.device_to_host(stream);
   stream.synchronize();
+  #if defined(__USE_NVCOMP_DECODE)
+  nvcomp_stream.synchronize();  
+  #endif
 
   // for list columns, add the final offset to every offset buffer.
   // TODO : make this happen in more efficiently. Maybe use thrust::for_each
@@ -1679,7 +1696,7 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
       }      
       out_buf.null_count() += pni[l_idx].null_count;
     }    
-  }
+  }  
 
   // add null counts from pages decoded from nvcomp
   #if defined(__USE_NVCOMP_DECODE)
@@ -1687,7 +1704,7 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
     for (size_t idx = 0; idx < nvc_src_col_indices.size(); idx++) {
       input_column_info const& input_col = _input_columns[nvc_src_col_indices[idx]];
       auto& out_buf = _output_columns[input_col.nesting[0]];
-      //printf("CU: %lu, %d, %d, %d (%d)\n", idx, nvc_src_col_indices[idx], input_col.nesting[0], nvc_null_counts[idx], out_buf.null_count());
+      // printf("CU: %lu, %d, %d, %d (%d)\n", idx, nvc_src_col_indices[idx], input_col.nesting[0], nvc_null_counts[idx], out_buf.null_count());
       out_buf.null_count() += nvc_null_counts[idx];
     }
   }
@@ -1900,6 +1917,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
       for (size_t i = 0; i < _output_columns.size(); ++i) {
         column_name_info& col_name = out_metadata.schema_info.emplace_back("");
         out_columns.emplace_back(make_column(_output_columns[i], &col_name, stream, _mr));
+        // printf("C(%lu): type %d\n", i, (int)out_columns[i]->type().id());
       }
     }
   }

@@ -243,6 +243,8 @@ struct ColumnChunkDesc {
 
   int32_t src_col_index;   // my input column index
   int32_t src_col_schema;  // my schema index in the file
+  
+  int dict_page_index;
 };
 
 /**
