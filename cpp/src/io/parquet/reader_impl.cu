@@ -1755,11 +1755,28 @@ reader::impl::impl(std::vector<std::unique_ptr<datasource>>&& sources,
                               _timestamp_type.id());
 }
 
+static thread_local pid_t pq_thread_id = -1;
+static thread_local pid_t pq_process_id = -1;
+static thread_local int pq_file_id = 0;
+
+#ifndef SYS_gettid
+#error "SYS_gettid unavailable on this system"
+#endif
+
+#define gettid() ((pid_t)syscall(SYS_gettid))
+
 table_with_metadata reader::impl::read(size_type skip_rows,
                                        size_type num_rows,
                                        std::vector<std::vector<size_type>> const& row_group_list,
                                        rmm::cuda_stream_view stream)
 {  
+  if(pq_process_id < 0){
+    pq_process_id = getpid();
+    pq_thread_id = gettid();
+  }  
+  std::cerr << "(pid: " << pq_process_id << " tid: " << pq_thread_id << ") Reading file " << pq_file_id << std::endl;
+  pq_file_id++;
+
   #if defined(__USE_NVCOMP_DECODE)
   if(skip_rows != 0 || num_rows != -1){
     CUDF_FAIL("This version of the cuIO parquet reader does not support user-supplied row bounds");
