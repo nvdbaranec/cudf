@@ -1607,7 +1607,7 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
   }
 
   // static thread_local rmm::cuda_stream nvcomp_stream;    
-  #if defined(__USE_NVCOMP_DECODE)
+  #if defined(__USE_NVCOMP_DECODE)  
   static thread_local cudaStream_t* _nvcomp_stream = nullptr;
   static thread_local rmm::cuda_stream_view nvcomp_stream;
   if(_nvcomp_stream == nullptr){
@@ -1615,7 +1615,7 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
     RMM_CUDA_TRY(cudaStreamCreateWithFlags(_nvcomp_stream, cudaStreamNonBlocking));
 
     nvcomp_stream = rmm::cuda_stream_view(*_nvcomp_stream);
-  }
+  }  
   #endif
 
   #if defined(__TIMING_ENABLE)
@@ -1755,6 +1755,7 @@ reader::impl::impl(std::vector<std::unique_ptr<datasource>>&& sources,
                               _timestamp_type.id());
 }
 
+/*
 static thread_local pid_t pq_thread_id = -1;
 static thread_local pid_t pq_process_id = -1;
 static thread_local int pq_file_id = 0;
@@ -1764,18 +1765,21 @@ static thread_local int pq_file_id = 0;
 #endif
 
 #define gettid() ((pid_t)syscall(SYS_gettid))
+*/
 
 table_with_metadata reader::impl::read(size_type skip_rows,
                                        size_type num_rows,
                                        std::vector<std::vector<size_type>> const& row_group_list,
                                        rmm::cuda_stream_view stream)
 {  
+   /*
   if(pq_process_id < 0){
     pq_process_id = getpid();
     pq_thread_id = gettid();
   }  
   std::cerr << "(pid: " << pq_process_id << " tid: " << pq_thread_id << ") Reading file " << pq_file_id << std::endl;
   pq_file_id++;
+  */
 
   #if defined(__USE_NVCOMP_DECODE)
   if(skip_rows != 0 || num_rows != -1){

@@ -199,19 +199,27 @@ __forceinline__ __device__ uint32_t calculate_run_length2(const uint8_t* current
  */
 template<int num_warps_per_block>
 __device__ cudf::size_type copy_validity_bits_safe(cudf::bitmask_type* dst,
-                          uint32_t dst_bit_offset,
-                          const uint8_t* src,
-                          uint32_t num_bytes,
-                          int local_warp_id)
+                                                   uint32_t bit_offset,      // offset with in the page
+                                                   uint32_t base_bit_offset, // base offset of ht epage
+                                                   int num_rows,             // num rows in the page
+                                                   const uint8_t* src,
+                                                   uint32_t num_bytes,
+                                                   int local_warp_id
+                                                   /*,int total_rows = 0*/)
 {
-  const int warp_lane = threadIdx.x % 32;
+  int const warp_lane = threadIdx.x % 32;
+
+  uint32_t const dst_bit_offset = bit_offset + base_bit_offset;
+  // we may have 1 byte (8 rows) of info, but only say 2 of the bits are relevant because we are at the last
+  // 2 rows.  we need to cap the # of bits we're writing so that we don't go past the end.
+  uint32_t const num_bits = min((num_bytes * 8), num_rows - bit_offset);
   
-  uint32_t end_bit_offset    = dst_bit_offset + (num_bytes * 8) - 1;
-  uint32_t start_output_byte = dst_bit_offset / 8;
-  uint32_t end_output_byte   = end_bit_offset / 8;
-  uint32_t start_output_word = dst_bit_offset / 32;
-  uint32_t end_output_word   = end_bit_offset / 32;
-  uint32_t* output           = reinterpret_cast<uint32_t*>(dst);         
+  uint32_t const end_bit_offset    = dst_bit_offset + num_bits - 1;
+  uint32_t const start_output_byte = dst_bit_offset / 8;
+  uint32_t const end_output_byte   = end_bit_offset / 8;
+  uint32_t const start_output_word = dst_bit_offset / 32;
+  uint32_t const end_output_word   = end_bit_offset / 32;
+  uint32_t* output           = reinterpret_cast<uint32_t*>(dst);           
     
   typedef cub::WarpReduce<uint8_t> WarpReduce;
   __shared__ typename WarpReduce::TempStorage temp_storage[num_warps_per_block];
@@ -251,9 +259,9 @@ __device__ cudf::size_type copy_validity_bits_safe(cudf::bitmask_type* dst,
     auto const mask = 0xf << sub_word_index;
     current_output |= __shfl_xor_sync(mask, current_output, 1, 4);
     current_output |= __shfl_xor_sync(mask, current_output, 2, 4);    
-    if(warp_lane % 4 == 0 && word_index <= end_output_word){
+    if(warp_lane % 4 == 0 && word_index <= end_output_word){            
       atomicOr(output + word_index, current_output);
-    }    
+    }
   }
 
   // only valid for lane 0
@@ -343,7 +351,7 @@ __device__ void set_validity_bits(cudf::bitmask_type* dst, uint32_t dst_bit_offs
   }
 }
 
-// kernel 4
+// (kernel) 4
 // constexpr int dict_buf_count = 32;
 // constexpr int dict_buf_size = dict_buf_count * 4;   // must be a multiple of 2
 
@@ -1669,7 +1677,8 @@ __global__ void decode_pages_kernel4(const void* const* page_data,
     current_input_pos = 0;
   }
   uint8_t* current_output_ptr            = output_data[page_idx];   // starts at the first output row for the page    
-  cudf::size_type current_bitmask_offset = output_bitmask_offset[page_idx];
+  // cudf::size_type current_bitmask_offset = output_bitmask_offset[page_idx];
+  cudf::size_type current_bitmask_offset = 0;
   cudf::size_type type_size = page_type_size[page_idx];
   int valid_count = page_bitmask_ptr == nullptr ? num_rows[page_idx] : 0;
   
@@ -1832,7 +1841,7 @@ __global__ void decode_pages_kernel4(const void* const* page_data,
         // bitpacked
         if(tag & 1){
           if(page_bitmask_ptr != nullptr){            
-            valid_count += copy_validity_bits_safe<num_warps_per_block>(page_bitmask_ptr, current_bitmask_offset, current_level_ptr, num_values/8, warp_id);
+            valid_count += copy_validity_bits_safe<num_warps_per_block>(page_bitmask_ptr, current_bitmask_offset, output_bitmask_offset[page_idx], num_rows[page_idx], current_level_ptr, num_values/8, warp_id);
           } else {
             printf("THIS SHOULDNT HAPPEN\n");
           }
@@ -1843,7 +1852,7 @@ __global__ void decode_pages_kernel4(const void* const* page_data,
           bool const valid = page_bitmask_ptr ? *current_level_ptr : true;
           if(valid){
             if(page_bitmask_ptr){
-              set_validity_bits_safe(page_bitmask_ptr, current_bitmask_offset, num_values);
+              set_validity_bits_safe(page_bitmask_ptr, current_bitmask_offset + output_bitmask_offset[page_idx], num_values);
             }
             valid_count += num_values;
           }
@@ -3116,7 +3125,8 @@ __global__ void decode_pages_kernel(const void* const* page_data,
     const uint8_t* current_data_ptr        = input_data_ptr;
     int current_data_pos                   = 0;                       // by value index. tracks current_data_ptr
     uint8_t* current_output_ptr            = output_data[page_idx];   // starts at the first output row for the page    
-    cudf::size_type current_bitmask_offset = output_bitmask_offset[page_idx];
+    // cudf::size_type current_bitmask_offset = output_bitmask_offset[page_idx];
+    cudf::size_type current_bitmask_offset = 0;
     cudf::size_type type_size = page_type_size[page_idx];
     cudf::size_type values_processed = 0;
     cudf::size_type valid_count = 0;    
@@ -3211,11 +3221,19 @@ __global__ void decode_pages_kernel(const void* const* page_data,
         }
         
         if(page_bitmask_ptr != nullptr){
-          valid_count += copy_validity_bits_safe<num_warps_per_block>(page_bitmask_ptr, current_bitmask_offset, current_level_ptr, length, local_warp_id);
+          /*
+          if(warp_lane == 0){
+            auto real_offset = current_bitmask_offset - output_bitmask_offset[page_idx];
+            if(real_offset + (length * 8) > ((num_rows[page_idx] + 7) / 8) * 8){
+              printf("BAD: %d, %d, (%d) %d\n", real_offset, length * 8, real_offset + (length * 8), ((num_rows[page_idx] + 7) / 8) * 8);
+            }
+          }
+          */
+          valid_count += copy_validity_bits_safe<num_warps_per_block>(page_bitmask_ptr, current_bitmask_offset, output_bitmask_offset[page_idx], num_rows[page_idx], current_level_ptr, length, local_warp_id);
           // copy_validity_bits(page_bitmask_ptr, current_bitmask_offset, current_level_ptr, length);
           current_level_ptr += length;
         }
-                
+
         current_output_ptr += (length * 8 * type_size); 
         current_bitmask_offset += (length * 8);
         values_processed += (length * 8);
@@ -3272,7 +3290,7 @@ __global__ void decode_pages_kernel(const void* const* page_data,
           current_data_ptr += (length * type_size);
           
           if(page_bitmask_ptr != nullptr){
-            set_validity_bits_safe(page_bitmask_ptr, current_bitmask_offset, length);
+            set_validity_bits_safe(page_bitmask_ptr, current_bitmask_offset + output_bitmask_offset[page_idx], length);
           }
           valid_count += length;
         }
@@ -3428,9 +3446,11 @@ std::pair<std::vector<cudf::size_type>, hostdevice_vector<cudf::size_type>> deco
     decompressed_ptrs[page_idx]        = pages[page_idx].page_data;   // will be null for dictionary pages
     uncompressed_bytes[page_idx]       = pages[page_idx].uncompressed_bytes;
     output_data_ptrs[page_idx]         = static_cast<uint8_t*>(pages[page_idx].output_data_ptr);    
+    /*
     if(output_data_ptrs[page_idx] != nullptr){
       cudaMemset(output_data_ptrs[page_idx], 0xff, output_type_sizes[page_idx] * num_rows[num_pages]);
     }
+    */
     output_null_mask_ptrs[page_idx]    = pages[page_idx].output_null_mask_ptr;
     output_null_mask_offsets[page_idx] = pages[page_idx].output_null_mask_offset;
     output_type_sizes[page_idx] = pages[page_idx].type_size;
