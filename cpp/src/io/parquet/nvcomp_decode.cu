@@ -1085,7 +1085,7 @@ __global__ void decode_pages_kernel6(const void* const* page_data,
     page_data_cur += 4;
   } else {
     definition_level_size = 0;
-  }  
+  }
   
   // pointer to the definition levels currently being decoded  
   uint8_t const* current_level_ptr = page_data_cur;
@@ -1650,7 +1650,7 @@ __global__ void decode_pages_kernel4(const void* const* page_data,
     page_data_cur += 4;
   } else {
     definition_level_size = 0;
-  }  
+  }
   
   // pointer to the definition levels currently being decoded  
   uint8_t const* current_level_ptr = page_data_cur;
@@ -3419,7 +3419,7 @@ std::optional<PageInfo> to_nvcomp(cudf::io::parquet::gpu::PageInfo const& page, 
  *
  * @param pages Pages to be decoded.
  */
-std::pair<std::vector<cudf::size_type>, hostdevice_vector<cudf::size_type>> decode_values(std::vector<PageInfo> const& pages, rmm::cuda_stream_view stream)
+std::pair<std::vector<cudf::size_type>, hostdevice_vector<cudf::size_type>> decode_values(std::vector<PageInfo> const& pages, rmm::cuda_stream_view stream, rmm::cuda_stream_view return_stream)
 {
   const auto num_pages = pages.size();    
 
@@ -3429,7 +3429,7 @@ std::pair<std::vector<cudf::size_type>, hostdevice_vector<cudf::size_type>> deco
   // size is 0.
   if (num_pages == 0){
      return {};
-  }
+  }  
 
   std::vector<void const*> decompressed_ptrs(num_pages);
   std::vector<std::size_t> uncompressed_bytes(num_pages);
@@ -3446,11 +3446,6 @@ std::pair<std::vector<cudf::size_type>, hostdevice_vector<cudf::size_type>> deco
     decompressed_ptrs[page_idx]        = pages[page_idx].page_data;   // will be null for dictionary pages
     uncompressed_bytes[page_idx]       = pages[page_idx].uncompressed_bytes;
     output_data_ptrs[page_idx]         = static_cast<uint8_t*>(pages[page_idx].output_data_ptr);    
-    /*
-    if(output_data_ptrs[page_idx] != nullptr){
-      cudaMemset(output_data_ptrs[page_idx], 0xff, output_type_sizes[page_idx] * num_rows[num_pages]);
-    }
-    */
     output_null_mask_ptrs[page_idx]    = pages[page_idx].output_null_mask_ptr;
     output_null_mask_offsets[page_idx] = pages[page_idx].output_null_mask_offset;
     output_type_sizes[page_idx] = pages[page_idx].type_size;
@@ -3460,17 +3455,35 @@ std::pair<std::vector<cudf::size_type>, hostdevice_vector<cudf::size_type>> deco
     dict_page_indices[page_idx] = pages[page_idx].dict_page_index;
   }
 
-  rmm::device_vector<void const*> device_decompressed_ptrs             = decompressed_ptrs;
-  rmm::device_vector<std::size_t> device_uncompressed_bytes            = uncompressed_bytes;
-  rmm::device_vector<uint8_t*> device_output_data_ptrs                 = output_data_ptrs;
-  rmm::device_vector<cudf::bitmask_type*> device_output_null_mask_ptrs = output_null_mask_ptrs;
-  rmm::device_vector<cudf::size_type> device_output_null_mask_offsets  = output_null_mask_offsets;
-  rmm::device_vector<cudf::size_type> device_output_type_sizes  = output_type_sizes;
-  rmm::device_vector<uint8_t const*> device_dicts = dicts;
-  rmm::device_vector<cudf::size_type> device_num_rows = num_rows;  
-  hostdevice_vector<cudf::size_type> device_output_null_counts(num_pages, stream);
-  rmm::device_vector<cudf::size_type> device_dict_page_indices = dict_page_indices;  
+  rmm::device_uvector<void const*> device_decompressed_ptrs(num_pages, stream);
+  cudaMemcpyAsync(device_decompressed_ptrs.data(), decompressed_ptrs.data(), sizeof(void const*) * num_pages, cudaMemcpyHostToDevice, stream);
+
+  rmm::device_uvector<std::size_t> device_uncompressed_bytes(num_pages, stream);
+  cudaMemcpyAsync(device_uncompressed_bytes.data(), uncompressed_bytes.data(), sizeof(std::size_t) * num_pages, cudaMemcpyHostToDevice, stream);
   
+  rmm::device_uvector<uint8_t*> device_output_data_ptrs(num_pages, stream);
+  cudaMemcpyAsync(device_output_data_ptrs.data(), output_data_ptrs.data(), sizeof(uint8_t*) * num_pages, cudaMemcpyHostToDevice, stream);
+
+  rmm::device_uvector<cudf::bitmask_type*> device_output_null_mask_ptrs(num_pages, stream);
+  cudaMemcpyAsync(device_output_null_mask_ptrs.data(), output_null_mask_ptrs.data(), sizeof(cudf::bitmask_type*) * num_pages, cudaMemcpyHostToDevice, stream);
+
+  rmm::device_uvector<cudf::size_type> device_output_null_mask_offsets(num_pages, stream);
+  cudaMemcpyAsync(device_output_null_mask_offsets.data(), output_null_mask_offsets.data(), sizeof(cudf::size_type) * num_pages, cudaMemcpyHostToDevice, stream);
+
+  rmm::device_uvector<cudf::size_type> device_output_type_sizes(num_pages, stream);
+  cudaMemcpyAsync(device_output_type_sizes.data(), output_type_sizes.data(), sizeof(cudf::size_type) * num_pages, cudaMemcpyHostToDevice, stream);
+
+  rmm::device_uvector<uint8_t const*> device_dicts(num_pages, stream);
+  cudaMemcpyAsync(device_dicts.data(), dicts.data(), sizeof(uint8_t const*) * num_pages, cudaMemcpyHostToDevice, stream);
+
+  rmm::device_uvector<cudf::size_type> device_num_rows(num_pages, stream);
+  cudaMemcpyAsync(device_num_rows.data(), num_rows.data(), sizeof(cudf::size_type) * num_pages, cudaMemcpyHostToDevice, stream);
+
+  hostdevice_vector<cudf::size_type> device_output_null_counts(num_pages, stream);  
+
+  rmm::device_uvector<cudf::size_type> device_dict_page_indices(num_pages, stream);
+  cudaMemcpyAsync(device_dict_page_indices.data(), dict_page_indices.data(), sizeof(cudf::size_type) * num_pages, cudaMemcpyHostToDevice, stream);
+
   if(Use_nvcomp_decode_path2){      
     // constexpr int num_warps_per_block = 24;
     constexpr int num_warps_per_block = 3;  
@@ -3518,7 +3531,7 @@ decode_relevant_pages(hostdevice_vector<cudf::io::parquet::gpu::ColumnChunkDesc>
 {  
   cudf::size_type dict_pages = 0;
 
-  hostdevice_vector<cudf::io::parquet::gpu::PageInfo> remainder(0, _pages.size(), stream);
+  hostdevice_vector<cudf::io::parquet::gpu::PageInfo> remainder(0, _pages.size(), return_stream);
   std::vector<PageInfo> nvcomp_pages;
   nvcomp_pages.reserve(_pages.size());
   std::for_each(_pages.begin(), _pages.end(), [&](cudf::io::parquet::gpu::PageInfo const &p){
@@ -3531,12 +3544,12 @@ decode_relevant_pages(hostdevice_vector<cudf::io::parquet::gpu::ColumnChunkDesc>
     } else {
       remainder.insert(p);
     }
-  });
+  });  
 
   // printf("NVC: %lu total pages (%d dict pages). nvcomp processing(%lu), cuIO processing(%lu)\n", _pages.size(), dict_pages, nvcomp_pages.size(), remainder.size());
 
   // invoke nvcomp decoding
-  auto [src_col_indices, null_counts] = decode_values(nvcomp_pages, stream);
+  auto [src_col_indices, null_counts] = decode_values(nvcomp_pages, stream, return_stream);  
   
   // return the remainder of the pages to cuIO for decoding.
   remainder.host_to_device(return_stream);

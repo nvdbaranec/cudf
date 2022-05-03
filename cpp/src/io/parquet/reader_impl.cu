@@ -1605,17 +1605,15 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
   if (total_str_dict_indexes > 0) {
     gpu::BuildStringDictionaryIndex(chunks.device_ptr(), chunks.size(), stream);
   }
-
-  // static thread_local rmm::cuda_stream nvcomp_stream;    
-  #if defined(__USE_NVCOMP_DECODE)  
+  
+  #if defined(__USE_NVCOMP_DECODE)
   static thread_local cudaStream_t* _nvcomp_stream = nullptr;
   static thread_local rmm::cuda_stream_view nvcomp_stream;
   if(_nvcomp_stream == nullptr){
     _nvcomp_stream = new cudaStream_t;
-    RMM_CUDA_TRY(cudaStreamCreateWithFlags(_nvcomp_stream, cudaStreamNonBlocking));
-
-    nvcomp_stream = rmm::cuda_stream_view(*_nvcomp_stream);
-  }  
+    RMM_CUDA_TRY(cudaStreamCreateWithFlags(_nvcomp_stream, cudaStreamNonBlocking));    
+    nvcomp_stream = rmm::cuda_stream_view(*_nvcomp_stream);        
+  }
   #endif
 
   #if defined(__TIMING_ENABLE)
@@ -1626,11 +1624,14 @@ void reader::impl::decode_page_data(hostdevice_vector<gpu::ColumnChunkDesc>& chu
   #endif  
 
     // if we're using nvcomp decode, intercept whatever pages we can send down the fast path.
-    #if defined(__USE_NVCOMP_DECODE)
+    #if defined(__USE_NVCOMP_DECODE)    
     hostdevice_vector<cudf::io::parquet::gpu::PageInfo> remainder_pages;
     std::vector<cudf::size_type> nvc_src_col_indices;
     hostdevice_vector<cudf::size_type> nvc_null_counts;
     if(Use_nvcomp_decode){
+      // various things set up on 'stream' might still be in flight and since we are launching this path on a seperate stream, we need
+      // to synchronize now.
+      stream.synchronize();
       std::tie(remainder_pages, nvc_src_col_indices, nvc_null_counts) = experimental::parquet::decode_relevant_pages(chunks, _pages, nvcomp_stream, stream);
     }
     hostdevice_vector<gpu::PageInfo>& pages = Use_nvcomp_decode ? remainder_pages : _pages;
