@@ -404,10 +404,12 @@ void orc_chunked_writer::close()
   writer->close();
 }
 
-using namespace cudf::io::detail::parquet;
 namespace detail_parquet = cudf::io::detail::parquet;
 
+namespace detail {
+
 table_with_metadata read_parquet(parquet_reader_options const& options,
+                                 rmm::cuda_stream_view stream,
                                  rmm::mr::device_memory_resource* mr)
 {
   CUDF_FUNC_RANGE();
@@ -415,7 +417,16 @@ table_with_metadata read_parquet(parquet_reader_options const& options,
   auto datasources = make_datasources(options.get_source());
   auto reader      = std::make_unique<detail_parquet::reader>(std::move(datasources), options, mr);
 
-  return reader->read(options);
+  return reader->read(options, stream);
+}
+} // namespace detail
+
+using namespace cudf::io::detail::parquet;
+
+table_with_metadata read_parquet(parquet_reader_options const& options,
+                                 rmm::mr::device_memory_resource* mr)
+{
+  return detail::read_parquet(options, rmm::cuda_stream_default, mr);
 }
 
 /**

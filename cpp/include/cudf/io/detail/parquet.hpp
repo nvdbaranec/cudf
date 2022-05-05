@@ -154,6 +154,29 @@ class writer {
 };
 
 };  // namespace parquet
+
+/**
+ * @brief Reads a Parquet dataset into a set of columns.
+ *
+ * The following code snippet demonstrates how to read a dataset from a file:
+ * @code
+ *  auto source  = cudf::io::source_info("dataset.parquet");
+ *  auto options = cudf::io::parquet_reader_options::builder(source);
+ *  auto result  = cudf::io::read_parquet(options);
+ * @endcode
+ *
+ * @param options Settings for controlling reading behavior
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate device memory of the table in the returned
+ * table_with_metadata
+ *
+ * @return The set of columns along with metadata
+ */
+table_with_metadata read_parquet(
+  parquet_reader_options const& options,
+  rmm::cuda_stream_view stream        = rmm::cuda_stream_default,
+  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+
 };  // namespace detail
 };  // namespace io
 };  // namespace cudf

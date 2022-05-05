@@ -1041,6 +1041,290 @@ void compute_round_info(int warp_lane,
 }
 
 template <int num_warps_per_block>
+__launch_bounds__(num_warps_per_block * 32)
+__global__ void decode_pages_kernel7(const void* const* page_data,
+                                    const std::size_t* page_size,
+                                    uint8_t* const* output_data,
+                                    cudf::bitmask_type* const* output_bitmask,
+                                    const cudf::size_type* output_bitmask_offset,
+                                    const cudf::size_type* page_type_size,
+                                    uint8_t const** dicts,
+                                    cudf::size_type const* num_rows,
+                                    cudf::size_type* output_null_counts,
+                                    int const *dict_page_indices,
+                                    std::size_t num_pages)
+{  
+  const int warp_id       = threadIdx.x / 32;  // warp id within a threadblock
+  const int page_idx      = blockIdx.x;
+  const int warp_lane     = threadIdx.x % 32;  
+
+  const bool anchor_thread = warp_id == 0 && warp_lane == 0;  
+
+  // page setup
+  const uint8_t* page_start            = static_cast<const uint8_t*>(page_data[page_idx]);
+  // have to set this to 0 before we exit.
+  if(anchor_thread){      
+    output_null_counts[page_idx] = 0;    
+  }
+
+  // if we're out of range or if this has no data (dictionary pages will have a nullptr here)
+  if(page_idx >= num_pages || page_data[page_idx] == nullptr){
+    return;
+  }  
+  
+  // all shared data
+  typedef cub::WarpScan<uint8_t> WarpScan;
+  __shared__ typename WarpScan::TempStorage temp_storage;  
+  __shared__ dict_info di;  
+
+  uint8_t const* page_data_cur         = page_start;    
+  cudf::bitmask_type* page_bitmask_ptr = output_bitmask[page_idx];  // starts at the absolute beginning of column validity output
+
+  // length of the encoded definition levels stored as 4 bytes little endian
+  uint32_t definition_level_size;
+  if(page_bitmask_ptr != nullptr){
+    definition_level_size = page_data_cur[0] + (page_data_cur[1] << 8) + (page_data_cur[2] << 16) + (page_data_cur[3] << 24);
+    page_data_cur += 4;
+  } else {
+    definition_level_size = 0;
+  }
+  
+  // pointer to the definition levels currently being decoded  
+  uint8_t const* current_level_ptr = page_data_cur;
+  auto level_start = current_level_ptr;
+  page_data_cur += definition_level_size; 
+
+  // dictionary handling
+  uint8_t const* dict = dicts[page_idx];
+  if(dict && anchor_thread){    
+    di.dict_val = 0;
+    di.dict_run = 0;
+    di.dict_bits = *page_data_cur; 
+    di.data_start = page_data_cur+1;
+    di.data_end = page_start + page_size[page_idx];   
+    di.dict_pos = 0;     
+    di.read_pos = 0;
+    di.dict_batch_len = 0;
+  }
+
+  // pointer to the start of the values section 
+  const uint8_t* input_data_ptr          = page_data_cur;
+  __shared__ int current_input_pos;
+  if(anchor_thread){
+    current_input_pos = 0;
+  }
+  uint8_t* current_output_ptr            = output_data[page_idx];   // starts at the first output row for the page    
+  // cudf::size_type current_bitmask_offset = output_bitmask_offset[page_idx];
+  cudf::size_type current_bitmask_offset = 0;
+  cudf::size_type type_size = page_type_size[page_idx];
+  int valid_count = page_bitmask_ptr == nullptr ? num_rows[page_idx] : 0;
+  
+  __syncthreads();
+  
+  // loop {
+  //   decode level data (should this be warpy?)
+  //   loop { if no dictionary data, all values are processed on the first iteration
+  //     warp 0 decodes dictionary data if necessary
+  //     warp 1 decodes values
+  //   }
+  //   warp 2 decode validity
+  // }    
+
+  // Keep going until the definition levels have been completely parsed
+  // Note that the end of the definition level section is the same as the start of the values
+  // section
+  int values_processed = 0;
+  while ((reinterpret_cast<uintptr_t>(current_level_ptr) < reinterpret_cast<uintptr_t>(input_data_ptr)) || (values_processed < num_rows[page_idx])){
+    // decode header stuff. should only 1 warp do this? I dunno.
+    uint8_t  const tag         = page_bitmask_ptr == nullptr ? 0 : *current_level_ptr;
+    uint32_t const run_length  = page_bitmask_ptr == nullptr ? num_rows[page_idx] : calculate_run_length(current_level_ptr);
+    // if this is a bitpacked run, there are 8 values for each byte in the level stream
+    auto const     run_num_values = (tag & 1) ? run_length * 8 : run_length;
+
+    // if we've got a dictionary, we have to process values in dict_buf_count chunks. otherwise
+    // we can decode it all in one shot  
+    // IMPORTANT: dict_buf_count must be a multiple of 8.      
+    int num_values = dict ? min(dict_buf_count, run_num_values) : run_num_values;
+
+    // warp 0 decodes the dictionary data (for the first iteration of the loop)
+    if(dict){
+      if(warp_id == 0){
+        // note that we are only dictionary indices for non-null inputs.  So even
+        // though the number of values in the level data (run_num_values) may be N, the number of dictionary
+        // indices we read may be < N.
+        dict_buffer_to2(&di, current_input_pos + (dict_buf_count * 2), warp_lane);      
+      }
+      __syncthreads();
+    }
+
+    int run_values_processed = 0;
+    while(run_values_processed < run_num_values){      
+      // warp 0 decodes dictionary data (for the next iteration of the loop)
+      if(dict && warp_id == 0){
+        // note that we are only dictionary indices for non-null inputs.  So even
+        // though the number of values in the level data (run_num_values) may be N, the number of dictionary
+        // indices we read may be < N.
+        dict_buffer_to2(&di, current_input_pos + (dict_buf_count * 2), warp_lane);        
+      }      
+
+      // warp 1 decodes values
+      if(warp_id == 1){
+        int _current_input_pos = current_input_pos;
+        auto _current_input_ptr = input_data_ptr + (_current_input_pos * type_size);
+
+        // bitpacked run
+        // For a flat data type like integer, each value has 1 bit stored in the definition level: 0
+        // for NULL, and 1 for not NULL. To copy values, note that Parquet does not store NULL
+        // values, while Arrow does. So, we use a warp scan to calculate the input location. To copy
+        // null masks, we can directly copy from the bitpacked definition levels.
+        if(tag & 1){          
+          std::size_t num_rounds = utility::roundUpDiv(num_values, 32);
+          for (std::size_t round_idx = 0; round_idx < num_rounds; round_idx++) {
+            std::size_t bit_idx         = round_idx * 32 + warp_lane;
+            std::size_t byte_idx        = bit_idx / 8;
+            std::size_t bit_idx_in_byte = bit_idx - byte_idx * 8;
+
+            uint8_t mask             = 0;
+            uint8_t exclusive_output = 0; // output position per thread
+            uint8_t warp_aggregate   = 0; // total # of values decoded for the whole warp
+
+            if (byte_idx < (num_values / 8)) {
+              uint8_t current_byte = current_level_ptr[byte_idx];
+              // mask will be either 0 or 1, indicating whether the current value is NULL
+              mask = (current_byte & (1 << bit_idx_in_byte)) >> bit_idx_in_byte;
+            }
+
+            WarpScan(temp_storage).ExclusiveSum(mask, exclusive_output, warp_aggregate);
+            
+            if (mask) {
+              auto const dict_pos = dict ? (_current_input_pos + exclusive_output) & (dict_buf_size - 1) : 0;
+              auto const dict_val = dict ? di.dict_idx[dict_pos] : 0;                                                        
+              auto const dict_ptr = dict; 
+
+              auto const src = dict ? dict_ptr + (dict_val * type_size)
+                                    : _current_input_ptr + exclusive_output * type_size;              
+
+              /*   
+              // printf("I: %d, %d, %d\n", dict_val, bit_idx, page_idx);              
+              uint64_t output_pos = ((current_output_ptr + (bit_idx * type_size)) - output_data[page_idx]) / type_size;              
+              if(page_idx == 0 && output_pos < 256){                
+                printf("COPYB0(%d): output_pos(%lu) <- dict_pos(%d, value:%d)\n", warp_lane, output_pos, dict_pos, dict_val);
+              }
+              */
+              switch(type_size){
+              case 4: copy_val4(current_output_ptr + (bit_idx * type_size), src); break;
+              case 8: copy_val8(current_output_ptr + (bit_idx * type_size), src); break;
+              default: break;
+              }
+            }
+
+            _current_input_ptr += (warp_aggregate * type_size);
+            _current_input_pos += warp_aggregate;
+          }
+        } 
+        // RLE run
+        // Again, for a flat data type, each value has 1 bit stored in the definition level: 0 or 1.
+        // So the repeated value must be either 0 or 1. If the repeated value is 0, it means we have
+        // repeated NULLs in the column. Since the NULL mask is initialized to 0, we do not need to
+        // do anything. If the repeated value is 1, we need to copy the data, and set the null mask
+        // to 1.
+        //
+        // For pages with no definition levels, pretend the validity value is just 1 and decode all
+        // the values in 1 loop          
+        else {
+          uint8_t repeated_value = page_bitmask_ptr == nullptr ? 1 : *current_level_ptr;
+          if (repeated_value) {
+            uint32_t output_base_idx = 0;
+            do {
+              int warp_aggregate = output_base_idx + 32 > num_values ? num_values - output_base_idx : 32;
+              
+              if(output_base_idx + warp_lane < num_values){
+                auto const output_idx = output_base_idx + warp_lane;
+
+                auto const dict_pos = dict ? (_current_input_pos + warp_lane) & (dict_buf_size - 1) : 0;
+                auto const dict_val = dict ? di.dict_idx[dict_pos] : 0;                
+                auto const dict_ptr = dict;                
+                auto const src = dict ? dict_ptr + (dict_val * type_size)
+                                      : _current_input_ptr + output_idx * type_size;
+
+                /*          
+                uint64_t output_pos = ((current_output_ptr + (output_idx * type_size)) - output_data[page_idx]) / type_size;                
+                if(page_idx == 0 && output_pos < 256){                  
+                  printf("COPYB1(%d): output_pos(%lu) <- dict_pos(%d, value:%d)\n", warp_lane, output_pos, dict_pos, dict_val);
+                } 
+                */               
+                // printf("I: %d, %d, %d\n", dict_val, output_idx, page_idx);
+                switch(type_size){
+                case 4: copy_val4(current_output_ptr + (output_idx * type_size), src); break;
+                case 8: copy_val8(current_output_ptr + (output_idx * type_size), src); break;
+                default: break;
+                } 
+              }
+
+              _current_input_pos += warp_aggregate;
+              output_base_idx += warp_aggregate;
+            } while(output_base_idx < num_values);
+          }
+        }
+
+        // warp 0 needs to know how many actual non-null values we processed so it 
+        // can buffer the dictionary appropriately
+        if(warp_lane == 0){
+          current_input_pos = _current_input_pos;
+        }  
+      
+        // bitpacked
+        if(tag & 1){
+          if(page_bitmask_ptr != nullptr){            
+            valid_count += copy_validity_bits_safe<1>(page_bitmask_ptr, current_bitmask_offset, output_bitmask_offset[page_idx], num_rows[page_idx], current_level_ptr, num_values/8, 0);
+          } else {
+            printf("THIS SHOULDNT HAPPEN\n");
+          }
+        }
+        // repeated
+        else {
+          // if this is not a nullable column or if the repeated value is 1 all the values are valid
+          bool const valid = page_bitmask_ptr ? *current_level_ptr : true;
+          if(valid){
+            if(page_bitmask_ptr){
+              set_validity_bits_safe(page_bitmask_ptr, current_bitmask_offset + output_bitmask_offset[page_idx], num_values);
+            }
+            valid_count += num_values;
+          }
+        }
+      }
+      
+      // everyone increments      
+      current_output_ptr += (num_values * type_size); 
+      current_bitmask_offset += num_values;
+      if((tag & 1) && page_bitmask_ptr){        
+        // 1 bit per value, so 8 values per byte.
+        current_level_ptr += num_values / 8;
+      } 
+      run_values_processed += num_values;
+
+      // next batch of values
+      num_values = dict ? min(dict_buf_count, run_num_values - run_values_processed) : run_num_values;
+     
+      __syncthreads();
+    } // inner value decoding loop
+
+    // increment
+    if(!(tag & 1) && page_bitmask_ptr){
+      current_level_ptr++;
+    }
+    values_processed += run_num_values;
+  }   // main work unit loop
+
+  // warp 1 computed the validity count
+  if(warp_id == 1 && warp_lane == 0){ 
+    // printf("PNULL COUNT(%d) : %d\n", page_idx, num_rows[page_idx] - valid_count);
+    output_null_counts[page_idx] = num_rows[page_idx] - valid_count;            
+  }
+}
+
+
+template <int num_warps_per_block>
 __global__ void decode_pages_kernel6(const void* const* page_data,
                                     const std::size_t* page_size,
                                     uint8_t* const* output_data,
@@ -1605,6 +1889,7 @@ __global__ void decode_pages_kernel5(const void* const* page_data,
 }
 
 template <int num_warps_per_block>
+__launch_bounds__(num_warps_per_block * 32)
 __global__ void decode_pages_kernel4(const void* const* page_data,
                                     const std::size_t* page_size,
                                     uint8_t* const* output_data,
@@ -1621,7 +1906,7 @@ __global__ void decode_pages_kernel4(const void* const* page_data,
   const int page_idx      = blockIdx.x;
   const int warp_lane     = threadIdx.x % 32;  
 
-  const bool anchor_thread = warp_id == 0 && warp_lane == 0;  
+  const bool anchor_thread = warp_id == 0 && warp_lane == 0;
 
   // page setup
   const uint8_t* page_start            = static_cast<const uint8_t*>(page_data[page_idx]);
@@ -3484,10 +3769,9 @@ std::pair<std::vector<cudf::size_type>, hostdevice_vector<cudf::size_type>> deco
   rmm::device_uvector<cudf::size_type> device_dict_page_indices(num_pages, stream);
   cudaMemcpyAsync(device_dict_page_indices.data(), dict_page_indices.data(), sizeof(cudf::size_type) * num_pages, cudaMemcpyHostToDevice, stream);
 
-  if(Use_nvcomp_decode_path2){      
-    // constexpr int num_warps_per_block = 24;
-    constexpr int num_warps_per_block = 3;  
-    decode_pages_kernel4<num_warps_per_block>
+  if(Use_nvcomp_decode_path2){          
+    constexpr int num_warps_per_block = 2;
+    decode_pages_kernel7<num_warps_per_block>
       <<<num_pages, num_warps_per_block * 32, 0, stream.value()>>>(
         thrust::raw_pointer_cast(device_decompressed_ptrs.data()),
         thrust::raw_pointer_cast(device_uncompressed_bytes.data()),
