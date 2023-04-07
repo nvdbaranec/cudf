@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+
 #include "parquet_gpu.hpp"
 #include <io/utilities/block_utils.cuh>
 #include <io/utilities/column_buffer.hpp>
