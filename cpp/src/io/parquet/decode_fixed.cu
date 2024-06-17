@@ -298,14 +298,14 @@ static __device__ int gpuUpdateValidityAndRowIndicesNested(
       }
 
       // if this is valid and we're at the leaf, output dst_pos
-      __syncthreads();  // handle modification of ni.value_count from below
+      __syncthreads();  // handle modification of ni.valid_count from below
       if (is_valid && d_idx == max_depth) {
         // for non-list types, the value count is always the same across
         int const dst_pos = (value_count + thread_value_count) - 1;
         int const src_pos = (ni.valid_count + thread_valid_count) - 1;
         sb->nz_idx[rolling_index<state_buf::nz_buf_size>(src_pos)] = dst_pos;
       }
-      __syncthreads();  // handle modification of ni.value_count from below
+      __syncthreads();  // handle modification of ni.valid_count from below
 
       // update stuff
       if (t == 0) { ni.valid_count += block_valid_count; }
@@ -792,7 +792,7 @@ DecodeSplitPageFixedWidthData(cudf::detail::hostdevice_span<PageInfo> pages,
       gpuDecodePageDataGeneric<uint8_t,
                                decode_block_size,
                                decode_kernel_mask::BYTE_STREAM_SPLIT_FIXED_WIDTH_NESTED,
-                               true,
+                               false,
                                true,
                                decode_fixed_width_split_values_func>
         <<<dim_grid, dim_block, 0, stream.value()>>>(
@@ -801,7 +801,7 @@ DecodeSplitPageFixedWidthData(cudf::detail::hostdevice_span<PageInfo> pages,
       gpuDecodePageDataGeneric<uint8_t,
                                decode_block_size,
                                decode_kernel_mask::BYTE_STREAM_SPLIT_FIXED_WIDTH_FLAT,
-                               true,
+                               false,
                                false,
                                decode_fixed_width_split_values_func>
         <<<dim_grid, dim_block, 0, stream.value()>>>(
@@ -812,7 +812,7 @@ DecodeSplitPageFixedWidthData(cudf::detail::hostdevice_span<PageInfo> pages,
       gpuDecodePageDataGeneric<uint16_t,
                                decode_block_size,
                                decode_kernel_mask::BYTE_STREAM_SPLIT_FIXED_WIDTH_NESTED,
-                               true,
+                               false,
                                true,
                                decode_fixed_width_split_values_func>
         <<<dim_grid, dim_block, 0, stream.value()>>>(
@@ -821,7 +821,7 @@ DecodeSplitPageFixedWidthData(cudf::detail::hostdevice_span<PageInfo> pages,
       gpuDecodePageDataGeneric<uint16_t,
                                decode_block_size,
                                decode_kernel_mask::BYTE_STREAM_SPLIT_FIXED_WIDTH_FLAT,
-                               true,
+                               false,
                                false,
                                decode_fixed_width_split_values_func>
         <<<dim_grid, dim_block, 0, stream.value()>>>(
