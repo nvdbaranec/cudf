@@ -803,6 +803,7 @@ std::vector<row_range> compute_page_splits_by_row(device_span<cumulative_page_in
   // Buffer needs to be padded, required by `gpuDecodePageData`.
   rmm::device_buffer decomp_pages(
     cudf::util::round_up_safe(total_decomp_size, BUFFER_PADDING_MULTIPLE), stream);
+  // cudaMemsetAsync(decomp_pages.data(), 'a', total_decomp_size, stream);
 
   auto comp_in =
     cudf::detail::make_empty_host_vector<device_span<uint8_t const>>(num_comp_pages, stream);
@@ -845,7 +846,8 @@ std::vector<row_range> compute_page_splits_by_row(device_span<cumulative_page_in
       page.page_data = dst_base;
       decomp_offset += page.uncompressed_page_size;
     });
-  }
+  } 
+
   auto d_comp_in = cudf::detail::make_device_uvector_async(
     comp_in, stream, rmm::mr::get_current_device_resource());
   auto d_comp_out = cudf::detail::make_device_uvector_async(
@@ -865,8 +867,15 @@ std::vector<row_range> compute_page_splits_by_row(device_span<cumulative_page_in
 
     switch (codec.compression_type) {
       case GZIP:
-        gpuinflate(
-          d_comp_in_view, d_comp_out_view, d_comp_res_view, gzip_header_included::YES, stream);
+        //gpuinflate(
+          //d_comp_in_view, d_comp_out_view, d_comp_res_view, gzip_header_included::YES, stream);        
+        nvcomp::batched_decompress(nvcomp::compression_type::GZIP,
+                                   d_comp_in_view,
+                                   d_comp_out_view,
+                                   d_comp_res_view,
+                                   codec.max_decompressed_size,
+                                   codec.total_decomp_size,
+                                   stream);
         break;
       case SNAPPY:
         if (cudf::io::nvcomp_integration::is_stable_enabled()) {
@@ -910,7 +919,7 @@ std::vector<row_range> compute_page_splits_by_row(device_span<cumulative_page_in
       default: CUDF_FAIL("Unexpected decompression dispatch"); break;
     }
     start_pos += codec.num_pages;
-  }
+  }  
 
   CUDF_EXPECTS(thrust::all_of(rmm::exec_policy(stream),
                               comp_res.begin(),
@@ -1072,8 +1081,14 @@ struct get_decomp_scratch {
   size_t operator()(decompression_info const& di) const
   {
     switch (di.codec) {
-      case UNCOMPRESSED:
-      case GZIP: return 0;
+      case UNCOMPRESSED: return 0;
+
+      case GZIP: 
+        return cudf::io::nvcomp::batched_decompress_temp_size(
+            cudf::io::nvcomp::compression_type::GZIP,
+            di.num_pages,
+            di.max_page_decompressed_size,
+            di.total_decompressed_size);
 
       case BROTLI: return get_gpu_debrotli_scratch_size(di.num_pages);
 
