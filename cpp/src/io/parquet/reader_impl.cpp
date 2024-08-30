@@ -38,6 +38,8 @@ namespace cudf::io::parquet::detail {
 
 std::mutex read_mutex;
 
+#define DECODE_EARLY_OUT
+
 namespace {
 // Tests the passed in logical type for a FIXED_LENGTH_BYTE_ARRAY column to see if it should
 // be treated as a string. Currently the only logical type that has special handling is DECIMAL.
@@ -369,8 +371,10 @@ void reader::impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num
   // synchronize the streams
   cudf::detail::join_streams(streams, _stream);  
 
+#if defined(DECODE_EARLY_OUT)
   _stream.synchronize();
   return;
+#endif
 
   subpass.pages.device_to_host_async(_stream);
   page_nesting.device_to_host_async(_stream);

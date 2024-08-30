@@ -49,10 +49,10 @@ std::mutex test_mutex;
 TEST_F(ParquetReaderTest, MtBug)
 {
   std::vector<std::string> files{"/home/dbaranec/projects/db_test/dbgdump586530430.parquet",
-                                /*"dbgdump803292850.parquet",
-                                "dbgdump854093345.parquet",
-                                "dbgdump952495839.parquet",
-                                "dbgdump962358700.parquet"*/};
+                                "/home/dbaranec/projects/db_test/dbgdump803292850.parquet",
+                                "/home/dbaranec/projects/db_test/dbgdump854093345.parquet",
+                                "/home/dbaranec/projects/db_test/dbgdump952495839.parquet",
+                                "/home/dbaranec/projects/db_test/dbgdump962358700.parquet"};
 
   auto task_func = [&files](){
     constexpr int num_runs = 10000000;
@@ -72,7 +72,9 @@ TEST_F(ParquetReaderTest, MtBug)
       auto in_opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{files[file_idx]}).build();
       auto result = cudf::io::read_parquet(in_opts, stream);
       
-      printf("%d\n", idx);
+      if(idx % 10 == 0){
+        printf("%d\n", idx);
+      }
 
       // comment in to make the problem go away
 #if defined(OUTER_MUTEX)
@@ -83,7 +85,7 @@ TEST_F(ParquetReaderTest, MtBug)
     return nullptr;
   };
 
-  run_tasks(2, task_func);
+  run_tasks(4, task_func);
 }
 
 TEST_F(ParquetReaderTest, UserBounds)

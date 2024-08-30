@@ -27,6 +27,8 @@
 
 #include <optional>
 
+#define USE_NVCOMP_GZIP
+
 namespace cudf::io::nvcomp {
 /**
  * @brief Device batch decompression of given type.

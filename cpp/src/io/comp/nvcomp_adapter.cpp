@@ -113,8 +113,10 @@ auto batched_decompress_get_temp_size(compression_type compression, Args&&... ar
     case compression_type::LZ4:
       return nvcompBatchedLZ4DecompressGetTempSize(std::forward<Args>(args)...);
 
+#if defined(USE_NVCOMP_GZIP)
     case compression_type::GZIP:
       return nvcompBatchedGzipDecompressGetTempSize(std::forward<Args>(args)...);
+#endif
     default: CUDF_FAIL("Unsupported compression type");
   }
 }
@@ -142,7 +144,9 @@ auto batched_decompress_async(compression_type compression, Args&&... args)
 #endif
     case compression_type::LZ4: return nvcompBatchedLZ4DecompressAsync(std::forward<Args>(args)...);
 
+#if defined(USE_NVCOMP_GZIP)
     case compression_type::GZIP: return nvcompBatchedGzipDecompressAsync(std::forward<Args>(args)...);
+#endif
     default: CUDF_FAIL("Unsupported compression type");
   }
 }
@@ -167,9 +171,6 @@ size_t batched_decompress_temp_size(compression_type compression,
   size_t temp_size   = 0;
   auto nvcomp_status = batched_decompress_get_temp_size_ex(
     compression, num_chunks, max_uncomp_chunk_size, &temp_size, max_total_uncomp_size);
-
-    size_t chk;
-    nvcompBatchedGzipDecompressGetTempSizeEx(num_chunks, max_uncomp_chunk_size, &chk, max_total_uncomp_size);
 
   if (nvcomp_status.value_or(nvcompStatus_t::nvcompErrorInternal) !=
       nvcompStatus_t::nvcompSuccess) {
@@ -642,8 +643,10 @@ std::optional<std::string> is_decompression_disabled_impl(compression_type compr
       }
       return std::nullopt;
     }
+#if defined(USE_NVCOMP_GZIP)
     case compression_type::GZIP:
       return std::nullopt;
+#endif
     default: return "Unsupported compression type";
   }
   return "Unsupported compression type";
