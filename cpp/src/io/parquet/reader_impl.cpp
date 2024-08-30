@@ -24,6 +24,8 @@
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/strings/detail/utilities.hpp>
 
+#include <cudf/detail/nvtx/ranges.hpp>
+
 #include <rmm/resource_ref.hpp>
 
 #include <thrust/binary_search.h>
@@ -33,6 +35,8 @@
 #include <numeric>
 
 namespace cudf::io::parquet::detail {
+
+std::mutex read_mutex;
 
 namespace {
 // Tests the passed in logical type for a FIXED_LENGTH_BYTE_ARRAY column to see if it should
@@ -213,10 +217,11 @@ void reader::impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num
   pass.chunks.host_to_device_async(_stream);
   chunk_nested_valids.host_to_device_async(_stream);
   chunk_nested_data.host_to_device_async(_stream);
-  if (has_strings) { chunk_nested_str_data.host_to_device_async(_stream); }
+  if (has_strings) { chunk_nested_str_data.host_to_device_async(_stream); }  
 
   // create this before we fork streams
   kernel_error error_code(_stream);
+  
 
   // get the number of streams we need from the pool and tell them to wait on the H2D copies
   int const nkernels = std::bitset<32>(kernel_mask).count();
@@ -224,7 +229,7 @@ void reader::impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num
 
   // launch string decoder
   int s_idx = 0;
-  if (BitAnd(kernel_mask, decode_kernel_mask::STRING) != 0) {
+  if (BitAnd(kernel_mask, decode_kernel_mask::STRING) != 0) {    
     DecodeStringPageData(subpass.pages,
                          pass.chunks,
                          num_rows,
@@ -327,7 +332,7 @@ void reader::impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num
   }
 
   // launch fixed width type decoder with dictionaries
-  if (BitAnd(kernel_mask, decode_kernel_mask::FIXED_WIDTH_DICT) != 0) {
+  if (BitAnd(kernel_mask, decode_kernel_mask::FIXED_WIDTH_DICT) != 0) {    
     DecodePageDataFixedDict(subpass.pages,
                             pass.chunks,
                             num_rows,
@@ -362,7 +367,10 @@ void reader::impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num
   }
 
   // synchronize the streams
-  cudf::detail::join_streams(streams, _stream);
+  cudf::detail::join_streams(streams, _stream);  
+
+  _stream.synchronize();
+  return;
 
   subpass.pages.device_to_host_async(_stream);
   page_nesting.device_to_host_async(_stream);
@@ -370,7 +378,7 @@ void reader::impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num
 
   if (auto const error = error_code.value_sync(_stream); error != 0) {
     CUDF_FAIL("Parquet data decode failed with code(s) " + kernel_error::to_string(error));
-  }
+  }  
 
   // for list columns, add the final offset to every offset buffer.
   // TODO : make this happen in more efficiently. Maybe use thrust::for_each
@@ -468,7 +476,7 @@ reader::impl::impl(std::size_t chunk_read_limit,
     _sources{std::move(sources)},
     _output_chunk_read_limit{chunk_read_limit},
     _input_pass_read_limit{pass_read_limit}
-{
+{  
   // Open and parse the source dataset metadata
   _metadata =
     std::make_unique<aggregate_reader_metadata>(_sources, options.is_enabled_use_arrow_schema());
@@ -567,10 +575,12 @@ table_with_metadata reader::impl::read_chunk_internal(read_mode mode)
   auto const& read_info = subpass.output_chunk_read_info[subpass.current_output_chunk];
 
   // Allocate memory buffers for the output columns.
-  allocate_columns(mode, read_info.skip_rows, read_info.num_rows);
+  allocate_columns(mode, read_info.skip_rows, read_info.num_rows);  
 
   // Parse data into the output buffers.
   decode_page_data(mode, read_info.skip_rows, read_info.num_rows);
+
+  return {};
 
   // Create the final output cudf columns.
   for (size_t i = 0; i < _output_buffers.size(); ++i) {
@@ -720,15 +730,23 @@ table_with_metadata reader::impl::finalize_output(read_mode mode,
 
 table_with_metadata reader::impl::read()
 {
+  CUDF_FUNC_RANGE();  
+  std::lock_guard<std::mutex> guard(read_mutex);
+
   CUDF_EXPECTS(_output_chunk_read_limit == 0,
                "Reading the whole file must not have non-zero byte_limit.");
 
   prepare_data(read_mode::READ_ALL);
-  return read_chunk_internal(read_mode::READ_ALL);
+  auto res = read_chunk_internal(read_mode::READ_ALL);
+  _stream.synchronize();
+  return res;
 }
 
 table_with_metadata reader::impl::read_chunk()
 {
+  CUDF_FUNC_RANGE();
+  std::lock_guard<std::mutex> guard(read_mutex);  
+
   // Reset the output buffers to their original states (right after reader construction).
   // Don't need to do it if we read the file all at once.
   if (_file_itm_data._current_input_pass < _file_itm_data.num_passes() and
@@ -745,6 +763,8 @@ table_with_metadata reader::impl::read_chunk()
 
 bool reader::impl::has_next()
 {
+  CUDF_FUNC_RANGE();
+
   prepare_data(read_mode::CHUNKED_READ);
 
   // current_input_pass will only be incremented to be == num_passes after

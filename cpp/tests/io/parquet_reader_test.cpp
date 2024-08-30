@@ -23,11 +23,68 @@
 #include <cudf_test/table_utilities.hpp>
 
 #include <cudf/column/column.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/transform.hpp>
+
+template<class Worker>
+void run_tasks(int num_threads, Worker func)
+{  
+  int idx;
+  std::vector<std::thread> threads;
+  for(idx=0; idx<num_threads; idx++){
+    threads.push_back(std::thread(func));
+  }  
+  while(1){
+    usleep(1000);
+  }
+}
+
+std::mutex test_mutex;
+
+// #define OUTER_MUTEX
+TEST_F(ParquetReaderTest, MtBug)
+{
+  std::vector<std::string> files{"/home/dbaranec/projects/db_test/dbgdump586530430.parquet",
+                                /*"dbgdump803292850.parquet",
+                                "dbgdump854093345.parquet",
+                                "dbgdump952495839.parquet",
+                                "dbgdump962358700.parquet"*/};
+
+  auto task_func = [&files](){
+    constexpr int num_runs = 10000000;
+    srand(std::hash<std::thread::id>{}(std::this_thread::get_id()) + static_cast<unsigned int>(time(nullptr)));
+
+    // remove the 0 to have different streams per thread
+    auto stream = cudf::detail::global_cuda_stream_pool().get_stream(0).value();
+
+    for(int idx=0; idx<num_runs; idx++){
+      // comment in to make the problem go away
+#if defined(OUTER_MUTEX)
+      usleep(100);
+      std::lock_guard<std::mutex> guard(test_mutex);
+#endif
+
+      auto const file_idx = rand() % files.size();
+      auto in_opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{files[file_idx]}).build();
+      auto result = cudf::io::read_parquet(in_opts, stream);
+      
+      printf("%d\n", idx);
+
+      // comment in to make the problem go away
+#if defined(OUTER_MUTEX)
+      cudf::get_default_stream().synchronize();
+#endif
+    }
+
+    return nullptr;
+  };
+
+  run_tasks(2, task_func);
+}
 
 TEST_F(ParquetReaderTest, UserBounds)
 {
@@ -2728,3 +2785,4 @@ TYPED_TEST(ParquetReaderPredicatePushdownTest, FilterTyped)
   EXPECT_EQ(result_table.num_columns(), expected->num_columns());
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected->view(), result_table);
 }
+
