@@ -3369,6 +3369,7 @@ void InitRowGroupFragments(device_2dspan<PageFragment> frag,
   dim3 const dim_grid(num_columns, grid_y);  // 1 threadblock per fragment
   gpuInitRowGroupFragments<512><<<dim_grid, 512, 0, stream.value()>>>(
     frag, col_desc, partitions, part_frag_offset, fragment_size);
+  stream.synchronize();
 }
 
 void CalculatePageFragments(device_span<PageFragment> frag,

@@ -33,6 +33,7 @@
 
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/copying.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/detail/get_value.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/detail/utilities/linked_column.hpp>
@@ -1133,7 +1134,9 @@ void init_row_group_fragments(cudf::detail::hostdevice_2dvector<PageFragment>& f
 {
   auto d_partitions = cudf::detail::make_device_uvector_async(
     partitions, stream, cudf::get_current_device_resource_ref());
+  stream.synchronize();
   InitRowGroupFragments(frag, col_desc, d_partitions, part_frag_offset, fragment_size, stream);
+  stream.synchronize();
   frag.device_to_host(stream);
 }
 
@@ -1202,6 +1205,7 @@ auto init_page_sizes(hostdevice_2dvector<EncColumnChunk>& chunks,
                    nullptr,
                    nullptr,
                    stream);
+  stream.synchronize();
   chunks.device_to_host(stream);
 
   int num_pages = 0;
@@ -1227,6 +1231,7 @@ auto init_page_sizes(hostdevice_2dvector<EncColumnChunk>& chunks,
                    nullptr,
                    nullptr,
                    stream);
+  stream.synchronize();
   page_sizes.device_to_host(stream);
 
   // Get per-page max compressed size
@@ -1251,6 +1256,7 @@ auto init_page_sizes(hostdevice_2dvector<EncColumnChunk>& chunks,
                    nullptr,
                    nullptr,
                    stream);
+  stream.synchronize();
   chunks.device_to_host(stream);
   return comp_page_sizes;
 }
@@ -1289,6 +1295,7 @@ build_chunk_dictionaries(hostdevice_2dvector<EncColumnChunk>& chunks,
     thrust::for_each(
       h_chunks.begin(), h_chunks.end(), [](auto& chunk) { chunk.use_dictionary = false; });
     chunks.host_to_device_async(stream);
+    stream.synchronize();
     return std::pair(std::move(dict_data), std::move(dict_index));
   }
 
@@ -1327,12 +1334,16 @@ build_chunk_dictionaries(hostdevice_2dvector<EncColumnChunk>& chunks,
 
   // Synchronize
   chunks.host_to_device_async(stream);
+  stream.synchronize();
   // Initialize storage with the given sentinel
   map_storage.initialize_async({KEY_SENTINEL, VALUE_SENTINEL}, {stream.value()});
+  stream.synchronize();
   // Populate the hash map for each chunk
   populate_chunk_hash_maps(map_storage_data, frags, stream);
+  stream.synchronize();
   // Synchronize again
   chunks.device_to_host(stream);
+  stream.synchronize();
 
   // Make decision about which chunks have dictionary
   bool cannot_honor_request = false;
@@ -1392,7 +1403,9 @@ build_chunk_dictionaries(hostdevice_2dvector<EncColumnChunk>& chunks,
   }
   chunks.host_to_device_async(stream);
   collect_map_entries(map_storage_data, chunks.device_view().flat_view(), stream);
+  stream.synchronize();
   get_dictionary_indices(map_storage_data, frags, stream);
+  stream.synchronize();
 
   return std::pair(std::move(dict_data), std::move(dict_index));
 }
@@ -1502,24 +1515,37 @@ void encode_pages(hostdevice_2dvector<EncColumnChunk>& chunks,
                comp_res.begin(),
                comp_res.end(),
                compression_result{0, compression_status::FAILURE});
+  stream.synchronize();
 
+  fprintf(stderr, "Page encode\n");
   EncodePages(pages, write_v2_headers, comp_in, comp_out, comp_res, stream);
+  stream.synchronize();
+  fprintf(stderr, "Page compress\n");
   compress(compression, comp_in, comp_out, comp_res, stream);
+  stream.synchronize();
 
   // TBD: Not clear if the official spec actually allows dynamically turning off compression at the
   // chunk-level
 
+  fprintf(stderr, "Header encode\n");
+
   auto d_chunks = chunks.device_view();
-  DecideCompression(d_chunks.flat_view(), stream);
+  DecideCompression(d_chunks.flat_view(), stream);  
+  stream.synchronize();
   EncodePageHeaders(pages, comp_res, pages_stats, chunk_stats, stream);
+  stream.synchronize();
   GatherPages(d_chunks.flat_view(), stream);
+  stream.synchronize();
 
   // By now, the var_bytes has been calculated in InitPages, and the histograms in EncodePages.
   // EncodeColumnIndexes can encode the histograms in the ColumnIndex, and also sum up var_bytes
   // and the histograms for inclusion in the chunk's SizeStats.
   if (column_stats != nullptr) {
+    fprintf(stderr, "Column index encode\n");
+
     EncodeColumnIndexes(
       d_chunks.flat_view(), {column_stats, pages.size()}, column_index_truncate_length, stream);
+    stream.synchronize();
   }
 
   chunks.device_to_host_async(stream);
@@ -1646,6 +1672,8 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   // initialize LinkedColVector
   auto vec = table_to_linked_columns(input);
 
+  fprintf(stderr, "Processing fragments\n");
+
   auto schema_tree = construct_parquet_schema_tree(
     vec, table_meta, write_mode, int96_timestamps, utc_timestamps, write_arrow_schema);
   // Construct parquet_column_views from the schema tree leaf nodes.
@@ -1753,8 +1781,10 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 
   auto d_part_frag_offset = cudf::detail::make_device_uvector_async(
     part_frag_offset, stream, cudf::get_current_device_resource_ref());
+  stream.synchronize();
   cudf::detail::hostdevice_2dvector<PageFragment> row_group_fragments(
     num_columns, num_fragments, stream);
+  stream.synchronize();
 
   // Create table_device_view so that corresponding column_device_view data
   // can be written into col_desc members
@@ -1767,7 +1797,9 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     col_desc.host_to_device_async(stream);
     leaf_column_views = create_leaf_column_device_views<parquet_column_device_view>(
       col_desc, *parent_column_table_device_view, stream);
+    stream.synchronize();
 
+    fprintf(stderr, "Processing fragments, step 2\n");
     init_row_group_fragments(row_group_fragments,
                              col_desc,
                              partitions,
@@ -1902,8 +1934,11 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   }
 
   row_group_fragments.host_to_device_async(stream);
+  fprintf(stderr, "Processing fragments, step 3\n");
+  stream.synchronize();
   [[maybe_unused]] auto dict_info_owner = build_chunk_dictionaries(
     chunks, col_desc, row_group_fragments, compression, dict_policy, max_dictionary_size, stream);
+  stream.synchronize();
 
   // The code preceding this used a uniform fragment size for all columns. Now recompute
   // fragments with a (potentially) varying number of fragments per column.
@@ -1950,10 +1985,15 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     }
 
     chunks.host_to_device_async(stream);
+    stream.synchronize();
+
+    fprintf(stderr, "Processing fragments, step 4\n");
 
     // re-initialize page fragments
     page_fragments.host_to_device_async(stream);
+    stream.synchronize();
     calculate_page_fragments(page_fragments, column_frag_size, stream);
+    stream.synchronize();
 
     // and gather fragment statistics
     if (not frag_stats.is_empty()) {
@@ -1963,6 +2003,8 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                                  stream);
     }
   }
+
+  fprintf(stderr, "Page setup\n");
 
   // Build chunk dictionaries and count pages. Sends chunks to device.
   auto comp_page_sizes = init_page_sizes(chunks,
@@ -2033,8 +2075,10 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 
   thrust::uninitialized_fill(
     rmm::exec_policy_nosync(stream), def_level_histogram.begin(), def_level_histogram.end(), 0);
+  stream.synchronize();
   thrust::uninitialized_fill(
     rmm::exec_policy_nosync(stream), rep_level_histogram.begin(), rep_level_histogram.end(), 0);
+  stream.synchronize();
 
   // This contains stats for both the pages and the rowgroups. TODO: make them separate.
   rmm::device_uvector<statistics_chunk> page_stats(num_stats_bfr, stream);
@@ -2086,6 +2130,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                        max_page_size_rows,
                        write_v2_headers,
                        stream);
+    stream.synchronize();
   }
 
   // Check device write support for all chunks and initialize bounce_buffer.
@@ -2108,6 +2153,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
       column_index_truncate_length,
       write_v2_headers,
       stream);
+    stream.synchronize();
 
     bool need_sync{false};
 
@@ -2163,6 +2209,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     }
 
     // Sync before calling the next `encode_pages` which may alter the stats data.
+    stream.synchronize();
     if (need_sync) { stream.synchronize(); }
 
     // now add to the column chunk SizeStatistics if necessary
@@ -2321,10 +2368,46 @@ void writer::impl::update_compression_statistics(
   }
 }
 
+// sanity check the table in various ways, seeing if we can expose any underlying issues in the data
+void validate_table(table_view const& input, rmm::cuda_stream_view stream)
+{
+  stream.synchronize();
+
+  auto temp_mr = cudf::get_current_device_resource_ref();
+
+  // reassemble the table by gathering every row
+  {
+    auto gather_map = cudf::make_fixed_width_column(data_type{type_id::INT32}, input.num_rows(), mask_state::UNALLOCATED, stream);  
+    cudf::mutable_column_view gm_view(*gather_map);
+    auto iter = thrust::make_counting_iterator(0);
+    fprintf(stderr, "Validating:  gather (copy)\n");
+    thrust::copy(rmm::exec_policy_nosync(stream, temp_mr), iter, iter + input.num_rows(), gm_view.begin<int>());
+    stream.synchronize();
+    
+    fprintf(stderr, "Validating:  gather (gather)\n");
+    auto result = cudf::gather(input, *gather_map, out_of_bounds_policy::DONT_CHECK, stream, temp_mr);
+    stream.synchronize();
+  }
+
+  // split the table into 4 pieces and concatenate
+  if(input.num_rows() > 16){
+    std::vector<int> splits{input.num_rows() / 4, input.num_rows() / 2, 3 * (input.num_rows() / 4)};
+    fprintf(stderr, "Validating:  concatenate (split)\n");
+    auto split_result = cudf::split(input, splits, stream);
+    stream.synchronize();
+    
+    fprintf(stderr, "Validating:  concatenate (concatenate)\n");
+    auto result = cudf::concatenate(split_result, stream, temp_mr);
+    stream.synchronize();
+  }
+}
+
 void writer::impl::write(table_view const& input, std::vector<partition_info> const& partitions)
 {
   _last_write_successful = false;
   CUDF_EXPECTS(not _closed, "Data has already been flushed to out and closed");
+
+  validate_table(input, _stream);
 
   if (not _table_meta) { _table_meta = std::make_unique<table_input_metadata>(input); }
   fill_table_meta(*_table_meta);
@@ -2446,6 +2529,8 @@ void writer::impl::write_parquet_data_to_sink(
     }
   }
 
+  _stream.synchronize();
+
   if (_stats_granularity == statistics_freq::STATISTICS_COLUMN) {
     // need pages on host to create offset_indexes
     auto const h_pages = cudf::detail::make_host_vector(pages, _stream);
@@ -2496,6 +2581,8 @@ void writer::impl::write_parquet_data_to_sink(
       }
     }
   }
+
+  _stream.synchronize();
 }
 
 std::unique_ptr<std::vector<uint8_t>> writer::impl::close(

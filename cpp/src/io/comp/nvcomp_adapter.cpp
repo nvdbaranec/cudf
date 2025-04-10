@@ -389,6 +389,7 @@ void batched_compress(compression_type compression,
                          nvcomp_args.output_data_ptrs.data(),
                          actual_compressed_data_sizes.data(),
                          stream.value());
+  stream.synchronize();
 
   update_compression_results(actual_compressed_data_sizes, results, stream);
 }
