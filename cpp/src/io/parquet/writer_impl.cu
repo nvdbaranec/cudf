@@ -65,6 +65,8 @@
 
 namespace cudf::io::parquet::detail {
 
+std::mutex pq_write_mutex;
+
 using namespace cudf::io::detail;
 
 Compression to_parquet_compression(compression_type compression)
@@ -1669,10 +1671,12 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                                    host_span<std::unique_ptr<data_sink> const> out_sink,
                                    rmm::cuda_stream_view stream)
 {
+  std::lock_guard<std::mutex> const lock(pq_write_mutex);
+
   // initialize LinkedColVector
   auto vec = table_to_linked_columns(input);
 
-  fprintf(stderr, "Processing fragments\n");
+  fprintf(stderr, "Processing fragments (global write mutex)\n");
 
   auto schema_tree = construct_parquet_schema_tree(
     vec, table_meta, write_mode, int96_timestamps, utc_timestamps, write_arrow_schema);
