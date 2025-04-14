@@ -790,11 +790,12 @@ table_with_metadata reader::impl::finalize_output(read_mode mode,
   return {std::make_unique<table>(std::move(out_columns)), std::move(out_metadata)};
 }
 
-extern std::mutex pq_read_write_mutex;
+// extern std::mutex pq_read_write_mutex;
+std::mutex pq_read_mutex;
 
 table_with_metadata reader::impl::read()
 {
-  std::lock_guard<std::mutex> const lock(pq_read_write_mutex);
+  std::lock_guard<std::mutex> const lock(pq_read_mutex);
 
   CUDF_EXPECTS(_output_chunk_read_limit == 0,
                "Reading the whole file must not have non-zero byte_limit.");
@@ -805,7 +806,7 @@ table_with_metadata reader::impl::read()
 
 table_with_metadata reader::impl::read_chunk()
 {
-  std::lock_guard<std::mutex> const lock(pq_read_write_mutex);
+  std::lock_guard<std::mutex> const lock(pq_read_mutex);
 
   // Reset the output buffers to their original states (right after reader construction).
   // Don't need to do it if we read the file all at once.
