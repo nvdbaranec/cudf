@@ -404,15 +404,22 @@ inline auto& prior_cudf_pinned_mr()
  *
  * Most of this comes directly from `pinned_host_memory_resource` in RMM.
  */
+constexpr int pinned_pool_id = 1;
+constexpr int fallback_pool_id = 2;
 class pinned_fallback_host_memory_resource {
  private:
   rmm_pinned_pool_t* _pool;
   void* pool_begin_;
   void* pool_end_;
 
+  std::map<uint64_t, int> alloc_id;
+  std::mutex alloc_mutex;
+
  public:
   pinned_fallback_host_memory_resource(rmm_pinned_pool_t* pool) : _pool(pool)
   {
+    fprintf(stderr, "INITIALIZING TRACKED PINNED FALLBACK RESOURCE\n");
+
     // allocate from the pinned pool the full size to figure out
     // our beginning and end address.
     auto pool_size = pool->pool_size();
@@ -441,10 +448,16 @@ class pinned_fallback_host_memory_resource {
                  [[maybe_unused]] std::size_t alignment = rmm::RMM_DEFAULT_HOST_ALIGNMENT)
   {
     try {
-      return _pool->allocate(bytes, alignment);
+      std::lock_guard<std::mutex> guard(alloc_mutex);
+      auto ret = _pool->allocate(bytes, alignment);      
+      alloc_id.insert({reinterpret_cast<uint64_t>(ret), pinned_pool_id});
+      return ret;
     } catch (std::exception const& unused) {
       // try to allocate using the underlying pinned resource
-      return prior_cudf_pinned_mr().allocate(bytes, alignment);
+      std::lock_guard<std::mutex> guard(alloc_mutex);
+      auto ret = prior_cudf_pinned_mr().allocate(bytes, alignment);
+      alloc_id.insert({reinterpret_cast<uint64_t>(ret), fallback_pool_id});
+      return ret;
     }
     // we should not reached here
     return nullptr;
@@ -462,10 +475,20 @@ class pinned_fallback_host_memory_resource {
   void deallocate(void* ptr,
                   std::size_t bytes,
                   std::size_t alignment = rmm::RMM_DEFAULT_HOST_ALIGNMENT) noexcept
-  {
-    if (ptr >= pool_begin_ && ptr <= pool_end_) {
+  {     
+    if (ptr >= pool_begin_ && ptr <= pool_end_) {      
+      std::lock_guard<std::mutex> guard(alloc_mutex);
+      auto iter = alloc_id.find(reinterpret_cast<uint64_t>(ptr));
+      CUDF_EXPECTS(iter != alloc_id.end(), "Could not find pinned allocation!?");
+      CUDF_EXPECTS(iter->second == pinned_pool_id, "Tried to deallocate fallback allocation in pinned allocator");
+      alloc_id.erase(iter);
       _pool->deallocate(ptr, bytes, alignment);
-    } else {
+    } else {      
+      std::lock_guard<std::mutex> guard(alloc_mutex);
+      auto iter = alloc_id.find(reinterpret_cast<uint64_t>(ptr));
+      CUDF_EXPECTS(iter != alloc_id.end(), "Could not find fallback allocation!?");
+      CUDF_EXPECTS(iter->second == fallback_pool_id, "Tried to deallocate pinned allocation in fallback allocator");
+      alloc_id.erase(iter);
       prior_cudf_pinned_mr().deallocate(ptr, bytes, alignment);
     }
   }
