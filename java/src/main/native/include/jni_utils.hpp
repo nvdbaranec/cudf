@@ -19,6 +19,8 @@
 
 #include <rmm/detail/error.hpp>
 
+#include <thrust/system/system_error.h>
+
 #include <jni.h>
 
 #include <algorithm>
@@ -905,36 +907,46 @@ inline nullptr_t del_global_ref(JNIEnv* env, jobject jobj)
   }
 
 #ifdef CUDF_BUILD_STACKTRACE_DEBUG
-#define GET_STACKTRACE(e, stacktrace_ptr)                                                    \
-  if (auto const cudf_ex = dynamic_cast<cudf::logic_error const*>(&e); cudf_ex != nullptr) { \
-    stacktrace = cudf_ex->stacktrace();                                                      \
+#define GET_STACKTRACE_FROM_EXCEPTION                                                              \
+  if (auto const st = dynamic_cast<cudf::stacktrace_recorder const*>(&e); st != nullptr) {         \
+    stacktrace = st->stacktrace();                                                                 \
+  } else if (auto const st = dynamic_cast<thrust_stacktrace_recorder const*>(&e); st != nullptr) { \
+    stacktrace = st->stacktrace();                                                                 \
+  } else if (auto const st = dynamic_cast<rmm_stacktrace_recorder const*>(&e); st != nullptr) {    \
+    stacktrace = st->stacktrace();                                                                 \
   }
-#else
-#define GET_STACKTRACE(e, stacktrace_ptr)
-#endif  // CUDF_BUILD_STACKTRACE_DEBUG
+inline char const* get_stacktrace(char const* str) { return str; }
+#else  // CUDF_BUILD_STACKTRACE_DEBUG
+// Define a no-op macro.
+#define GET_STACKTRACE_FROM_EXCEPTION
+// When the stacktrace build is disabled, the generated stacktrace string is not a null string
+// and needs to be excluded from processing.
+inline char const* get_stacktrace(char const*) { return nullptr; }
+#endif
 
 #define CATCH_STD_CLASS(env, class_name, ret_val)                                                 \
-  catch (const rmm::out_of_memory& e)                                                             \
+  catch (cudf::fatal_cuda_error const& e)                                                         \
   {                                                                                               \
-    JNI_EXCEPTION_OCCURRED_CHECK(env, ret_val);                                                   \
-    auto const what =                                                                             \
-      std::string("Could not allocate native memory: ") + (e.what() == nullptr ? "" : e.what());  \
-    JNI_THROW_NEW(env, cudf::jni::OOM_CLASS, what.c_str(), ret_val);                              \
+    JNI_CHECK_THROW_CUDA_EXCEPTION(env,                                                           \
+                                   cudf::jni::CUDA_FATAL_ERROR_CLASS,                             \
+                                   e.what(),                                                      \
+                                   get_stacktrace(e.stacktrace()),                                \
+                                   e.error_code(),                                                \
+                                   ret_val);                                                      \
   }                                                                                               \
-  catch (const cudf::fatal_cuda_error& e)                                                         \
+  catch (cudf::cuda_error const& e)                                                               \
   {                                                                                               \
-    JNI_CHECK_THROW_CUDA_EXCEPTION(                                                               \
-      env, cudf::jni::CUDA_FATAL_ERROR_CLASS, e.what(), e.stacktrace(), e.error_code(), ret_val); \
+    JNI_CHECK_THROW_CUDA_EXCEPTION(env,                                                           \
+                                   cudf::jni::CUDA_ERROR_CLASS,                                   \
+                                   e.what(),                                                      \
+                                   get_stacktrace(e.stacktrace()),                                \
+                                   e.error_code(),                                                \
+                                   ret_val);                                                      \
   }                                                                                               \
-  catch (const cudf::cuda_error& e)                                                               \
-  {                                                                                               \
-    JNI_CHECK_THROW_CUDA_EXCEPTION(                                                               \
-      env, cudf::jni::CUDA_ERROR_CLASS, e.what(), e.stacktrace(), e.error_code(), ret_val);       \
-  }                                                                                               \
-  catch (const cudf::data_type_error& e)                                                          \
+  catch (cudf::data_type_error const& e)                                                          \
   {                                                                                               \
     JNI_CHECK_THROW_CUDF_EXCEPTION(                                                               \
-      env, cudf::jni::CUDF_DTYPE_ERROR_CLASS, e.what(), e.stacktrace(), ret_val);                 \
+      env, cudf::jni::CUDF_DTYPE_ERROR_CLASS, e.what(), get_stacktrace(e.stacktrace()), ret_val); \
   }                                                                                               \
   catch (std::overflow_error const& e)                                                            \
   {                                                                                               \
@@ -944,10 +956,10 @@ inline nullptr_t del_global_ref(JNIEnv* env, jobject jobj)
                                    "No native stacktrace is available.",                          \
                                    ret_val);                                                      \
   }                                                                                               \
-  catch (const std::exception& e)                                                                 \
+  catch (std::exception const& e)                                                                 \
   {                                                                                               \
     char const* stacktrace = nullptr;                                                             \
-    GET_STACKTRACE(e, stacktrace)                                                                 \
+    GET_STACKTRACE_FROM_EXCEPTION                                                                 \
     /* Double check whether the thrown exception is unrecoverable CUDA error or not. */           \
     /* Like cudf::detail::throw_cuda_error, it is nearly certain that a fatal error  */           \
     /* occurred if the second call doesn't return with cudaSuccess. */                            \

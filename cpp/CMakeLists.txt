@@ -812,6 +812,11 @@ set_property(
   PROPERTY COMPILE_DEFINITIONS "CUDF_VERSION=${PROJECT_VERSION}"
 )
 
+set(CUDF_VISIBILITY_PRESET hidden)
+if(CUDF_BUILD_STACKTRACE_DEBUG)
+  set(CUDF_VISIBILITY_PRESET default)
+endif()
+
 set_target_properties(
   cudf
   PROPERTIES BUILD_RPATH "\$ORIGIN"
@@ -821,10 +826,10 @@ set_target_properties(
              CXX_STANDARD_REQUIRED ON
              # For std:: support of __int128_t. Can be removed once using cuda::std
              CXX_EXTENSIONS ON
-             CXX_VISIBILITY_PRESET hidden
+             CXX_VISIBILITY_PRESET ${CUDF_VISIBILITY_PRESET}
              CUDA_STANDARD 17
              CUDA_STANDARD_REQUIRED ON
-             CUDA_VISIBILITY_PRESET hidden
+             CUDA_VISIBILITY_PRESET ${CUDF_VISIBILITY_PRESET}
              POSITION_INDEPENDENT_CODE ON
              INTERFACE_POSITION_INDEPENDENT_CODE ON
              LINK_FLAGS "-Wl,--exclude-libs,libzstd.a"

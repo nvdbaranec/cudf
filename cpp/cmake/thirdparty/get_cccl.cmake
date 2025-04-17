@@ -1,5 +1,5 @@
 # =============================================================================
-# Copyright (c) 2023, NVIDIA CORPORATION.
+# Copyright (c) 2023-2025, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License. You may obtain a copy of the License at
@@ -19,7 +19,11 @@ function(find_and_configure_cccl)
   include(${rapids-cmake-dir}/cpm/package_override.cmake)
 
   set(cudf_patch_dir "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/patches")
-  rapids_cpm_package_override("${cudf_patch_dir}/cccl_override.json")
+  if(CUDF_BUILD_STACKTRACE_DEBUG)
+    rapids_cpm_package_override("${cudf_patch_dir}/cccl_override_with_stacktrace.json")
+  else()
+    rapids_cpm_package_override("${cudf_patch_dir}/cccl_override.json")
+  endif()
 
   # Make sure we install cccl into the `include/libcudf` subdirectory instead of the default
   include(GNUInstallDirs)

@@ -220,6 +220,11 @@ target_include_directories(
 # * compile options
 # ---------------------------------------------------------------------------------
 
+set(CUDFJNI_VISIBILITY_PRESET hidden)
+if(CUDF_BUILD_STACKTRACE_DEBUG)
+  set(CUDFJNI_VISIBILITY_PRESET default)
+endif()
+
 # Override RPATH for cudfjni
 set_target_properties(
   cudfjni
@@ -228,8 +233,10 @@ set_target_properties(
              # set target compile options
              CXX_STANDARD 17
              CXX_STANDARD_REQUIRED ON
+             CXX_VISIBILITY_PRESET ${CUDFJNI_VISIBILITY_PRESET}
              CUDA_STANDARD 17
              CUDA_STANDARD_REQUIRED ON
+             CUDA_VISIBILITY_PRESET ${CUDFJNI_VISIBILITY_PRESET}
              POSITION_INDEPENDENT_CODE ON
              INTERFACE_POSITION_INDEPENDENT_CODE ON
 )
