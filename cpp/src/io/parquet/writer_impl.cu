@@ -1268,6 +1268,30 @@ size_t max_page_bytes(compression_type compression, size_t max_page_size_bytes)
   return std::min<size_t>(max_size, std::numeric_limits<int32_t>::max());
 }
 
+void htod1(hostdevice_2dvector<EncColumnChunk>& chunks, rmm::cuda_stream_view stream)
+{
+  chunks.host_to_device_async(stream);
+  stream.synchronize();
+}
+
+void htod2(hostdevice_2dvector<EncColumnChunk>& chunks, rmm::cuda_stream_view stream)
+{
+  chunks.host_to_device_async(stream);
+  stream.synchronize();
+}
+
+void htod3(hostdevice_2dvector<EncColumnChunk>& chunks, rmm::cuda_stream_view stream)
+{
+  chunks.host_to_device_async(stream);
+  stream.synchronize();
+}
+
+void dtoh1(hostdevice_2dvector<EncColumnChunk>& chunks, rmm::cuda_stream_view stream)
+{
+  chunks.device_to_host(stream);
+  stream.synchronize();
+}
+
 std::pair<std::vector<rmm::device_uvector<size_type>>, std::vector<rmm::device_uvector<size_type>>>
 build_chunk_dictionaries(hostdevice_2dvector<EncColumnChunk>& chunks,
                          host_span<parquet_column_device_view const> col_desc,
@@ -1290,7 +1314,8 @@ build_chunk_dictionaries(hostdevice_2dvector<EncColumnChunk>& chunks,
   if (dict_policy == dictionary_policy::NEVER) {
     thrust::for_each(
       h_chunks.begin(), h_chunks.end(), [](auto& chunk) { chunk.use_dictionary = false; });
-    chunks.host_to_device_async(stream);
+    // chunks.host_to_device_async(stream);
+    htod1(chunks, stream);
     return std::pair(std::move(dict_data), std::move(dict_index));
   }
 
@@ -1328,13 +1353,15 @@ build_chunk_dictionaries(hostdevice_2dvector<EncColumnChunk>& chunks,
   device_span<bucket_type> const map_storage_data{map_storage.data(), total_map_storage_size};
 
   // Synchronize
-  chunks.host_to_device_async(stream);
+  htod2(chunks, stream);
+  // chunks.host_to_device_async(stream);
   // Initialize storage with the given sentinel
   map_storage.initialize_async({KEY_SENTINEL, VALUE_SENTINEL}, {stream.value()});
   // Populate the hash map for each chunk
   populate_chunk_hash_maps(map_storage_data, frags, stream);
   // Synchronize again
-  chunks.device_to_host(stream);
+  dtoh1(chunks, stream);
+  // chunks.device_to_host(stream);
 
   // Make decision about which chunks have dictionary
   bool cannot_honor_request = false;
@@ -1392,7 +1419,8 @@ build_chunk_dictionaries(hostdevice_2dvector<EncColumnChunk>& chunks,
     chunk.dict_data           = inserted_dict_data.data();
     chunk.dict_index          = inserted_dict_index.data();
   }
-  chunks.host_to_device_async(stream);
+  // chunks.host_to_device_async(stream);
+  htod3(chunks, stream);
   collect_map_entries(map_storage_data, chunks.device_view().flat_view(), stream);
   get_dictionary_indices(map_storage_data, frags, stream);
 
