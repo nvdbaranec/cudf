@@ -156,24 +156,39 @@ __device__ constexpr size_t underflow_safe_subtract(size_t a, size_t b)
 
 void __device__ init_frag_state(frag_init_state_s* const s,
                                 uint32_t fragment_size,
-                                int part_end_row)
+                                int part_end_row,
+                                bool init_or_calc)
 {
   // frag.num_rows = fragment_size except for the last fragment in partition which can be
   // smaller. num_rows is fixed but fragment size could be larger if the data is strings or
-  // nested.
-  s->frag.num_rows           = min(fragment_size, part_end_row - s->frag.start_row);
+  // nested.  
+  int64_t const nr_chk = min(fragment_size, part_end_row - s->frag.start_row);
+  if(nr_chk < 0 || nr_chk > 65535){
+    printf("IFS0(%d): %lld (%u %d %d)\n", (int)init_or_calc, nr_chk, fragment_size, part_end_row, s->frag.start_row);
+  }
+  s->frag.num_rows           = min(fragment_size, part_end_row - s->frag.start_row);  
   s->frag.num_dict_vals      = 0;
   s->frag.fragment_data_size = 0;
   s->frag.dict_data_size     = 0;
 
-  s->frag.start_value_idx  = row_to_value_idx(s->frag.start_row, s->col);
-  auto const end_value_idx = row_to_value_idx(s->frag.start_row + s->frag.num_rows, s->col);
+  s->frag.start_value_idx  = row_to_value_idx(s->frag.start_row, s->col, 1);
+  auto const end_value_idx = row_to_value_idx(s->frag.start_row + s->frag.num_rows, s->col, 1);
+  if(end_value_idx < s->frag.start_value_idx){
+    int64_t chk = end_value_idx - s->frag.start_value_idx;
+    printf("IFS1(%d): %d %u %lld\n", (int)init_or_calc, end_value_idx, s->frag.start_value_idx, chk);
+  }
   s->frag.num_leaf_values  = end_value_idx - s->frag.start_value_idx;
 
   if (s->col.level_offsets != nullptr) {
     // For nested schemas, the number of values in a fragment is not directly related to the
     // number of encoded data elements or the number of rows.  It is simply the number of
     // repetition/definition values which together encode validity and nesting information.
+    if(s->frag.start_row < 0){
+      printf("IFS2(%d): %d %d %d %d\n", (int)init_or_calc, s->frag.start_row, s->frag.num_rows, s->col.level_offsets[s->frag.start_row], s->col.level_offsets[s->frag.start_row + s->frag.num_rows]);
+    }
+    if((uint64_t)s->col.level_offsets == 0xffffffffffffffff){
+      printf("IFS3(%d): Invalid level offsets\n", (int)init_or_calc);
+    }
     auto const first_level_val_idx = s->col.level_offsets[s->frag.start_row];
     auto const last_level_val_idx  = s->col.level_offsets[s->frag.start_row + s->frag.num_rows];
     s->frag.num_values             = last_level_val_idx - first_level_val_idx;
@@ -183,10 +198,14 @@ void __device__ init_frag_state(frag_init_state_s* const s,
 }
 
 template <int block_size>
-void __device__ calculate_frag_size(frag_init_state_s* const s, int t)
+void __device__ calculate_frag_size(frag_init_state_s* const s, int t, bool init_or_calc)
 {
   using block_reduce = cub::BlockReduce<uint32_t, block_size>;
   __shared__ typename block_reduce::TempStorage reduce_storage;
+
+  if((uint64_t)s->col.leaf_column == 0xffffffffffffffff){
+    printf("CFS0(%d): Invalid leaf column ptr\n", (int)init_or_calc);
+  }
 
   auto const physical_type   = s->col.physical_type;
   auto const leaf_type       = s->col.leaf_column->type().id();
@@ -206,10 +225,28 @@ void __device__ calculate_frag_size(frag_init_state_s* const s, int t)
       if (physical_type == Type::BYTE_ARRAY) {
         switch (leaf_type) {
           case type_id::STRING: {
+            if((uint64_t)(s->col.leaf_column->head<void>()) == 0xffffffffffffffff){
+              printf("CFS1(%d): Invalid string ptr\n", (int)init_or_calc);
+            }
             auto str = s->col.leaf_column->element<string_view>(val_idx);
             len += str.size_bytes();
           } break;
           case type_id::LIST: {
+            {
+              using et              = statistics::byte_array_view::element_type;
+              auto& col = *s->col.leaf_column;
+              auto row = val_idx;
+              size_type const index = row + col.offset();  // account for this view's _offset
+              auto const* d_offsets = col.child(lists_column_view::offsets_column_index).data<size_type>();
+              if((uint64_t)(s->col.leaf_column->head<void>()) == 0xffffffffffffffff){
+                printf("CFS2(%d): Invalid child offsets ptr\n", (int)init_or_calc);
+              }
+              auto const* d_data    = col.child(lists_column_view::child_column_index).data<et>();
+               if((uint64_t)(s->col.leaf_column->head<void>()) == 0xffffffffffffffff){
+                printf("CFS3(%d): Invalid child data ptr\n", (int)init_or_calc);
+              }
+            }
+
             auto list_element =
               get_element<statistics::byte_array_view>(*s->col.leaf_column, val_idx);
             len += list_element.size_bytes();
@@ -445,14 +482,24 @@ CUDF_KERNEL void __launch_bounds__(block_size)
       auto it =
         thrust::upper_bound(thrust::seq, part_frag_offset.begin(), part_frag_offset.end(), frag_y);
       int const p            = it - part_frag_offset.begin() - 1;
+      if(p < 0 || p > part_frag_offset.size()){
+        printf("IRGF0: %d (%d)\n", p, (int)part_frag_offset.size());
+      }
       int const part_end_row = partitions[p].start_row + partitions[p].num_rows;
+      if(part_end_row < 0){
+        printf("IRGF1: %d\n", part_end_row);
+      }
+      int64_t chk = (frag_y - part_frag_offset[p]) * fragment_size + partitions[p].start_row;
+      if(chk < 0){
+       printf("IRGF2: %lld (%u %d %u %d)\n", chk, frag_y, part_frag_offset[p], fragment_size, partitions[p].start_row);
+      }      
       s->frag.start_row = (frag_y - part_frag_offset[p]) * fragment_size + partitions[p].start_row;
       s->frag.chunk     = frag[blockIdx.x][frag_y].chunk;
-      init_frag_state(s, fragment_size, part_end_row);
+      init_frag_state(s, fragment_size, part_end_row, true);
     }
     __syncthreads();
 
-    calculate_frag_size<block_size>(s, t);
+    calculate_frag_size<block_size>(s, t, true);
     __syncthreads();
     if (t == 0) { frag[blockIdx.x][frag_y] = s->frag; }
   }
@@ -466,23 +513,40 @@ CUDF_KERNEL void __launch_bounds__(block_size)
 {
   __shared__ __align__(16) frag_init_state_s state_g;
 
+  if((uint64_t)frag.data() == 0xffffffffffffffff){
+    printf("GCPF0: %d Invalid frag span\n", (int)blockIdx.x);
+  }
   EncColumnChunk* const ck_g = frag[blockIdx.x].chunk;
+  if((uint64_t)ck_g == 0xffffffffffffffff){
+    printf("GCPF1: %d Invalid chunk ptr\n", (int)blockIdx.x);
+  }
   frag_init_state_s* const s = &state_g;
   uint32_t const t           = threadIdx.x;
+  if((uint64_t)column_frag_sizes.data() == 0xffffffffffffffff){
+    printf("GCPF2: %d Invalid frag ptr\n", (int)blockIdx.x);
+  }
   auto const fragment_size   = column_frag_sizes[ck_g->col_desc_id];
 
-  if (t == 0) { s->col = *ck_g->col_desc; }
+  if (t == 0) {
+    if((uint64_t)ck_g->col_desc == 0xffffffffffffffff){
+     printf("GCPF3: %d Invalid col_desc\n", (int)blockIdx.x);
+    }
+    s->col = *ck_g->col_desc; 
+  }
   __syncthreads();
 
   if (t == 0) {
     int const part_end_row = ck_g->start_row + ck_g->num_rows;
     s->frag.start_row      = ck_g->start_row + (blockIdx.x - ck_g->first_fragment) * fragment_size;
+    if(part_end_row < s->frag.start_row){
+      printf("GCPF4: %d %d %u %u\n", part_end_row, ck_g->start_row, ck_g->num_rows, ck_g->first_fragment);
+    }
     s->frag.chunk          = ck_g;
-    init_frag_state(s, fragment_size, part_end_row);
+    init_frag_state(s, fragment_size, part_end_row, false);
   }
   __syncthreads();
 
-  calculate_frag_size<block_size>(s, t);
+  calculate_frag_size<block_size>(s, t, false);
   if (t == 0) { frag[blockIdx.x] = s->frag; }
 }
 

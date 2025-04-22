@@ -73,7 +73,7 @@ inline uint32_t __device__ int32_logical_len(type_id id)
  * they only have one immediate child.
  */
 inline size_type __device__ row_to_value_idx(size_type idx,
-                                             parquet_column_device_view const& parquet_col)
+                                             parquet_column_device_view const& parquet_col, int context = 0)
 {
   // with a byte array, we can't go all the way down to the leaf node, but instead we want to leave
   // the size at the parent level because we are writing out parent row byte arrays.
@@ -86,7 +86,11 @@ inline size_type __device__ row_to_value_idx(size_type idx,
       auto list_col = cudf::detail::lists_column_device_view(col);
       auto child    = list_col.child();
       if (parquet_col.output_as_byte_array && child.type().id() == type_id::UINT8) { break; }
-      idx = list_col.offset_at(idx);
+      auto const tmp = list_col.offset_at(idx);
+      if(idx < 0 || idx >= child.size()){
+        printf("RTV(%d): %d %d\n", context, idx, tmp);
+      }
+      idx = tmp;
       col = child;
     }
   }
