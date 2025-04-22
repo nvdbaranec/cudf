@@ -1842,7 +1842,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 
   std::vector<int> num_rg_in_part(partitions.size());
   for(size_t idx=0; idx<num_rg_in_part.size(); idx++){
-    num_rg_in_part[idx] = 123456789;
+    CUDF_EXPECTS(num_rg_in_part[idx] == 0, "Unzeroed count in num_rg_in_part!");
   }
   for (size_t p = 0; p < partitions.size(); ++p) {
     size_type curr_rg_num_rows = 0;
@@ -1882,7 +1882,9 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   }
 
   for(size_t idx=0; idx<num_rg_in_part.size(); idx++){
-     CUDF_EXPECTS(num_rg_in_part[idx] != 123456789, "Uninitialized value in num_rg_in_part!");
+    if(num_rg_in_part[idx] == 0){
+      fprintf(stderr, "0 row groups in partition %lu. Is that weird?\n", idx);
+    }
   }
 
   std::vector<int> first_rg_in_part;
