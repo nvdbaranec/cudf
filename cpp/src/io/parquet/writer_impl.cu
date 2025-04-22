@@ -1786,6 +1786,14 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   cudf::detail::hostdevice_2dvector<PageFragment> row_group_fragments(
     num_columns, num_fragments, stream);
 
+  EncColumnChunk* sentinel = (EncColumnChunk*)(0x1234567812345678);
+
+  for(size_t x_idx=0; x_idx<row_group_fragments.size().first; x_idx++){
+    for(size_t y_idx=0; y_idx<row_group_fragments.size().second; y_idx++){
+      row_group_fragments[x_idx][y_idx].chunk = sentinel;
+    }
+  }
+
   // Create table_device_view so that corresponding column_device_view data
   // can be written into col_desc members
   // These are unused but needs to be kept alive.
@@ -1833,6 +1841,9 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   size_type num_rowgroups = 0;
 
   std::vector<int> num_rg_in_part(partitions.size());
+  for(size_t idx=0; idx<num_rg_in_part.size(); idx++){
+    num_rg_in_part[idx] = 123456789;
+  }
   for (size_t p = 0; p < partitions.size(); ++p) {
     size_type curr_rg_num_rows = 0;
     size_t curr_rg_data_size   = 0;
@@ -1870,6 +1881,10 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     }
   }
 
+  for(size_t idx=0; idx<num_rg_in_part.size(); idx++){
+     CUDF_EXPECTS(num_rg_in_part[idx] != 123456789, "Uninitialized value in num_rg_in_part!");
+  }
+
   std::vector<int> first_rg_in_part;
   std::exclusive_scan(
     num_rg_in_part.begin(), num_rg_in_part.end(), std::back_inserter(first_rg_in_part), 0);
@@ -1892,6 +1907,14 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
       row_group.total_byte_size = 0;
       row_group.columns.resize(num_columns);
       for (int c = 0; c < num_columns; c++) {
+        if(r + first_rg_in_part[p] >= (int)chunks.size().first){
+          fprintf(stderr, "Out of bounds x index: %d %d\n", (int)r + first_rg_in_part[p], (int)chunks.size().first);
+        }
+        CUDF_EXPECTS(r + first_rg_in_part[p] < (int)chunks.size().first, "Out of bounds x index");
+        if(c >= (int)chunks.size().second){
+          fprintf(stderr, "Out of bounds y index: %d %d\n", (int)c, (int)chunks.size().second);
+        }
+        CUDF_EXPECTS(r + c < (int)chunks.size().second, "Out of bounds y index");
         EncColumnChunk& ck = chunks[r + first_rg_in_part[p]][c];
 
         ck                   = {};
@@ -1931,6 +1954,24 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     }
   }
 
+  for(size_t x_idx=0; x_idx<row_group_fragments.size().first; x_idx++){
+    for(size_t y_idx=0; y_idx<row_group_fragments.size().second; y_idx++){
+      if(row_group_fragments[x_idx][y_idx].chunk == nullptr){
+        fprintf(stderr, "Null rg fragment: %lu %lu\n", x_idx, y_idx);
+      }
+      CUDF_EXPECTS(row_group_fragments[x_idx][y_idx].chunk != nullptr, "Unexpected null rg fragment!");
+      if(row_group_fragments[x_idx][y_idx].chunk == sentinel){
+        fprintf(stderr, "Uninitialized rg fragment: %lu %lu\n", x_idx, y_idx);
+      }
+      CUDF_EXPECTS(row_group_fragments[x_idx][y_idx].chunk != sentinel, "Unexpected uninitialized chunk in rg fragment!");
+      uint64_t chk = (uint64_t)row_group_fragments[x_idx][y_idx].chunk;
+      if(chk == 0xffffffffffffffff){
+        fprintf(stderr, "Bogus rg fragment: %lu %lu\n", x_idx, y_idx);
+      }
+      CUDF_EXPECTS(chk != 0xffffffffffffffff, "Unexpected bogus chunk in rg fragment!");
+    }
+  }
+
   row_group_fragments.host_to_device_async(stream);
   [[maybe_unused]] auto dict_info_owner = build_chunk_dictionaries(
     chunks, col_desc, row_group_fragments, compression, dict_policy, max_dictionary_size, stream);
@@ -1946,6 +1987,10 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 
   rmm::device_uvector<statistics_chunk> frag_stats(0, stream);
   cudf::detail::hostdevice_vector<PageFragment> page_fragments(total_frags, stream);
+  
+  for(size_t idx=0; idx<page_fragments.size(); idx++){
+    page_fragments[idx].chunk = sentinel;
+  }
 
   // update fragments and/or prepare for fragment statistics calculation if necessary
   if (total_frags != 0) {
@@ -1977,6 +2022,22 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
           frag_offset += fragments_in_chunk;
         }
       }
+    }
+
+    for(size_t idx=0; idx<page_fragments.size(); idx++){
+      if(page_fragments[idx].chunk == nullptr){
+        fprintf(stderr, "Null fragment: %lu\n", idx);
+      }
+      CUDF_EXPECTS(page_fragments[idx].chunk != nullptr, "Unexpected null fragment!");
+      if(page_fragments[idx].chunk == sentinel){
+        fprintf(stderr, "Uninitialized fragment: %lu\n", idx);
+      }
+      CUDF_EXPECTS(page_fragments[idx].chunk != sentinel, "Unexpected uninitialized chunk in fragment!");
+      uint64_t chk = (uint64_t)page_fragments[idx].chunk;
+      if(chk == 0xffffffffffffffff){
+        fprintf(stderr, "Bogus fragment: %lu\n", idx);
+      }
+      CUDF_EXPECTS(chk != 0xffffffffffffffff, "Unexpected bogus chunk in fragment!");
     }
 
     chunks.host_to_device_async(stream);
