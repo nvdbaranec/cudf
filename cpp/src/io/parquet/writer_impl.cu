@@ -1699,7 +1699,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                                    host_span<std::unique_ptr<data_sink> const> out_sink,
                                    rmm::cuda_stream_view stream)
 {
-  write_binary(input, stream);
+  auto pqbin_name = write_binary(input, stream);
 
   // initialize LinkedColVector
   auto vec = table_to_linked_columns(input);
@@ -1801,7 +1801,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                  });
 
   size_type num_fragments = std::reduce(num_frag_in_part.begin(), num_frag_in_part.end());
-  fprintf(stderr, "max_page_fragment_size: %d  num_fragments: %d\n", max_page_fragment_size, num_fragments);
+  fprintf(stderr, "(%s) max_page_fragment_size: %d  num_fragments: %d\n", pqbin_name.c_str(), max_page_fragment_size, num_fragments);
 
   auto part_frag_offset =
     cudf::detail::make_empty_host_vector<int>(num_frag_in_part.size() + 1, stream);
@@ -1836,12 +1836,15 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     leaf_column_views = create_leaf_column_device_views<parquet_column_device_view>(
       col_desc, *parent_column_table_device_view, stream);
 
+    fprintf(stderr, "START init_row_group_fragments (%s)\n", pqbin_name.c_str());
     init_row_group_fragments(row_group_fragments,
                              col_desc,
                              partitions,
                              d_part_frag_offset,
                              max_page_fragment_size,
                              stream);
+    stream.synchronize();
+    fprintf(stderr, "END init_row_group_fragments (%s)\n", pqbin_name.c_str());
   }
 
   std::unique_ptr<aggregate_writer_metadata> agg_meta;
@@ -1911,12 +1914,6 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     }
   }
 
-  for(size_t idx=0; idx<num_rg_in_part.size(); idx++){
-    if(num_rg_in_part[idx] == 0){
-      fprintf(stderr, "0 row groups in partition %lu. Is that weird?\n", idx);
-    }
-  }
-
   std::vector<int> first_rg_in_part;
   std::exclusive_scan(
     num_rg_in_part.begin(), num_rg_in_part.end(), std::back_inserter(first_rg_in_part), 0);
@@ -1940,11 +1937,11 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
       row_group.columns.resize(num_columns);
       for (int c = 0; c < num_columns; c++) {
         if(r + first_rg_in_part[p] >= (int)chunks.size().first){
-          fprintf(stderr, "Out of bounds x index: %d %d\n", (int)r + first_rg_in_part[p], (int)chunks.size().first);
+          fprintf(stderr, "(%s) Out of bounds x index: %d %d\n", pqbin_name.c_str(), (int)r + first_rg_in_part[p], (int)chunks.size().first);
         }
         CUDF_EXPECTS(r + first_rg_in_part[p] < (int)chunks.size().first, "Out of bounds x index");
         if(c >= (int)chunks.size().second){
-          fprintf(stderr, "Out of bounds y index: %d %d\n", (int)c, (int)chunks.size().second);
+          fprintf(stderr, "(%s) Out of bounds y index: %d %d\n", pqbin_name.c_str(), (int)c, (int)chunks.size().second);
         }
         CUDF_EXPECTS(c < (int)chunks.size().second, "Out of bounds y index");
         EncColumnChunk& ck = chunks[r + first_rg_in_part[p]][c];
@@ -1989,24 +1986,27 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   for(size_t x_idx=0; x_idx<row_group_fragments.size().first; x_idx++){
     for(size_t y_idx=0; y_idx<row_group_fragments.size().second; y_idx++){
       if(row_group_fragments[x_idx][y_idx].chunk == nullptr){
-        fprintf(stderr, "Null rg fragment: %lu %lu %d\n", x_idx, y_idx, num_fragments);
+        fprintf(stderr, "(%s) Null rg fragment: %lu %lu %d\n", pqbin_name.c_str(), x_idx, y_idx, num_fragments);
       }
       //CUDF_EXPECTS(row_group_fragments[x_idx][y_idx].chunk != nullptr, "Unexpected null rg fragment!");
       if(row_group_fragments[x_idx][y_idx].chunk == sentinel){
-        fprintf(stderr, "Uninitialized rg fragment: %lu %lu %d\n", x_idx, y_idx, num_fragments);
+        fprintf(stderr, "(%s) Uninitialized rg fragment: %lu %lu %d\n", pqbin_name.c_str(), x_idx, y_idx, num_fragments);
       }
       //CUDF_EXPECTS(row_group_fragments[x_idx][y_idx].chunk != sentinel, "Unexpected uninitialized chunk in rg fragment!");
       uint64_t chk = (uint64_t)row_group_fragments[x_idx][y_idx].chunk;
       if(chk == 0xffffffffffffffff){
-        fprintf(stderr, "Bogus rg fragment: %lu %lu %d\n", x_idx, y_idx, num_fragments);
+        fprintf(stderr, "(%s) Bogus rg fragment: %lu %lu %d\n", pqbin_name.c_str(), x_idx, y_idx, num_fragments);
       }
       //CUDF_EXPECTS(chk != 0xffffffffffffffff, "Unexpected bogus chunk in rg fragment!");
     }
   }
 
   row_group_fragments.host_to_device_async(stream);
+  fprintf(stderr, "START build_chunk_dictionaries (%s)\n", pqbin_name.c_str());
   [[maybe_unused]] auto dict_info_owner = build_chunk_dictionaries(
     chunks, col_desc, row_group_fragments, compression, dict_policy, max_dictionary_size, stream);
+  stream.synchronize();
+  fprintf(stderr, "END build_chunk_dictionaries (%s)\n", pqbin_name.c_str());
 
   // The code preceding this used a uniform fragment size for all columns. Now recompute
   // fragments with a (potentially) varying number of fragments per column.
@@ -2058,22 +2058,22 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 
       auto const expected_last = c == num_columns - 1 ? total_frags : frag_offsets[c+1];
       if(frag_offset != expected_last){
-        fprintf(stderr, "Did not visit all page_fragments for column %d (%d %d)!\n", c, (int)frag_offset, (int)expected_last);
+        fprintf(stderr, "(%s) Did not visit all page_fragments for column %d (%d %d)!\n", pqbin_name.c_str(), c, (int)frag_offset, (int)expected_last);
       }
     }
 
     for(size_t idx=0; idx<page_fragments.size(); idx++){
       if(page_fragments[idx].chunk == nullptr){
-        fprintf(stderr, "Null fragment: %lu %d\n", idx, total_frags);
+        fprintf(stderr, "(%s) Null fragment: %lu %d\n", pqbin_name.c_str(), idx, total_frags);
       }
       //CUDF_EXPECTS(page_fragments[idx].chunk != nullptr, "Unexpected null fragment!");
       if(page_fragments[idx].chunk == sentinel){
-        fprintf(stderr, "Uninitialized fragment: %lu %d\n", idx, total_frags);
+        fprintf(stderr, "(%s) Uninitialized fragment: %lu %d\n", pqbin_name.c_str(), idx, total_frags);
       }
       //CUDF_EXPECTS(page_fragments[idx].chunk != sentinel, "Unexpected uninitialized chunk in fragment!");
       uint64_t chk = (uint64_t)page_fragments[idx].chunk;
       if(chk == 0xffffffffffffffff){
-        fprintf(stderr, "Bogus fragment: %lu %d\n", idx, total_frags);
+        fprintf(stderr, "(%s) Bogus fragment: %lu %d\n", pqbin_name.c_str(), idx, total_frags);
       }
       //CUDF_EXPECTS(chk != 0xffffffffffffffff, "Unexpected bogus chunk in fragment!");
     }
@@ -2082,7 +2082,10 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 
     // re-initialize page fragments
     page_fragments.host_to_device_async(stream);
+    fprintf(stderr, "START calculate_page_fragments (%s)\n", pqbin_name.c_str());
     calculate_page_fragments(page_fragments, column_frag_size, stream);
+    stream.synchronize();
+    fprintf(stderr, "END calculate_page_fragments (%s)\n", pqbin_name.c_str());
 
     // and gather fragment statistics
     if (not frag_stats.is_empty()) {
