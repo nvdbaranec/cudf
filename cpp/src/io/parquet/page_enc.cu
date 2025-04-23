@@ -517,9 +517,12 @@ CUDF_KERNEL void __launch_bounds__(block_size)
     printf("GCPF0: %d Invalid frag span\n", (int)blockIdx.x);
   }
   EncColumnChunk* const ck_g = frag[blockIdx.x].chunk;
+  if(frag[blockIdx.x].chunk == nullptr){
+    return;
+  }
   if((uint64_t)ck_g == 0xffffffffffffffff){
     printf("GCPF1: %d Invalid chunk ptr\n", (int)blockIdx.x);
-  }
+  }  
   frag_init_state_s* const s = &state_g;
   uint32_t const t           = threadIdx.x;
   if((uint64_t)column_frag_sizes.data() == 0xffffffffffffffff){
@@ -559,13 +562,17 @@ CUDF_KERNEL void __launch_bounds__(128)
   uint32_t const frag_id = blockIdx.x * 4 + (threadIdx.x / cudf::detail::warp_size);
   if (frag_id < fragments.size()) {
     if (lane_id == 0) {
-      statistics_group g;
-      auto* const ck_g = fragments[frag_id].chunk;
-      g.col            = ck_g->col_desc;
-      g.start_row      = fragments[frag_id].start_value_idx;
-      g.num_rows       = fragments[frag_id].num_leaf_values;
-      g.non_leaf_nulls = fragments[frag_id].num_values - g.num_rows;
-      groups[frag_id]  = g;
+      if(fragments[frag_id].chunk == nullptr){
+        printf("Empty fragment in gpuInitFragmentStats\n");
+      } else {
+        statistics_group g;
+        auto* const ck_g = fragments[frag_id].chunk;
+        g.col            = ck_g->col_desc;
+        g.start_row      = fragments[frag_id].start_value_idx;
+        g.num_rows       = fragments[frag_id].num_leaf_values;
+        g.non_leaf_nulls = fragments[frag_id].num_values - g.num_rows;
+        groups[frag_id]  = g;
+      }
     }
   }
 }

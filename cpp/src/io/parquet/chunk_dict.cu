@@ -217,6 +217,10 @@ CUDF_KERNEL void __launch_bounds__(block_size)
   auto const col_idx = blockIdx.y;
   auto const block_x = blockIdx.x;
   auto const frag    = frags[col_idx][block_x];
+  // empty fragment
+  if(frag.chunk == nullptr){
+    return;
+  }
   auto chunk         = frag.chunk;
   auto col           = chunk->col_desc;
 
@@ -279,6 +283,9 @@ CUDF_KERNEL void __launch_bounds__(block_size)
   auto const col_idx = blockIdx.y;
   auto const block_x = blockIdx.x;
   auto const frag    = frags[col_idx][block_x];
+  if(frag.chunk == nullptr){
+    return;
+  }
   auto chunk         = frag.chunk;
 
   if (not chunk->use_dictionary) { return; }
