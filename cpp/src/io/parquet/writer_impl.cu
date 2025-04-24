@@ -1132,11 +1132,12 @@ void init_row_group_fragments(cudf::detail::hostdevice_2dvector<PageFragment>& f
                               host_span<partition_info const> partitions,
                               device_span<int const> part_frag_offset,
                               uint32_t fragment_size,
-                              rmm::cuda_stream_view stream)
+                              rmm::cuda_stream_view stream,
+                              std::string const& name)
 {
   auto d_partitions = cudf::detail::make_device_uvector_async(
     partitions, stream, cudf::get_current_device_resource_ref());
-  InitRowGroupFragments(frag, col_desc, d_partitions, part_frag_offset, fragment_size, stream);
+  InitRowGroupFragments(frag, col_desc, d_partitions, part_frag_offset, fragment_size, stream, name);
   frag.device_to_host(stream);
 }
 
@@ -1648,7 +1649,7 @@ std::string write_binary(table_view const& input,
 /*
 void compare_metadata(table_input_metadata const& a, table_input_metadata const& b)
 {
-  if(a.size() != b.size()){
+  if(a.column_metadata.size() != b.column_metadata.size()){
     fprintf(stderr, "Table metadata column_metadata size mismatch (%lu %d)\n", a.size(), b.size());
   }
   // CUDF_EXPECTS(a.size() == b.size(), "Table metadata column_metadata size mismatch");
@@ -1718,13 +1719,15 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 {
   auto pqbin_name = write_binary(input, stream);
 
-//  auto meta_compare = std::make_unique<table_input_metadata>(input);  
-//  fill_table_meta(*meta_compare);
-//  compare_metadata(table_meta, *meta_compare);
+  /*
+  auto meta_compare = std::make_unique<table_input_metadata>(input);  
+  fill_table_meta(*meta_compare);
+  compare_metadata(table_meta, *meta_compare);
   printf("PINFO(%s): num partitions(%d)\n", pqbin_name.c_str(), (int)partitions.size());
   for(size_t idx=0; idx<partitions.size(); idx++){
     printf("PINFO(%s): partition(%d %d->%d)\n", pqbin_name.c_str(), (int)idx, partitions[idx].start_row, partitions[idx].num_rows);
   }
+  */
 
   // initialize LinkedColVector
   auto vec = table_to_linked_columns(input);
@@ -1826,7 +1829,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                  });
 
   size_type num_fragments = std::reduce(num_frag_in_part.begin(), num_frag_in_part.end());
-  fprintf(stderr, "(%s) max_page_fragment_size: %d  num_fragments: %d\n", pqbin_name.c_str(), max_page_fragment_size, num_fragments);
+  fprintf(stderr, "(%s) max_page_fragment_size: %d  num_fragments: %d  num_columns: %d\n", pqbin_name.c_str(), max_page_fragment_size, num_fragments, (int)num_columns);
 
   auto part_frag_offset =
     cudf::detail::make_empty_host_vector<int>(num_frag_in_part.size() + 1, stream);
@@ -1867,7 +1870,8 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                              partitions,
                              d_part_frag_offset,
                              max_page_fragment_size,
-                             stream);
+                             stream,
+                             pqbin_name);
     stream.synchronize();
     fprintf(stderr, "END init_row_group_fragments (%s)\n", pqbin_name.c_str());
   }

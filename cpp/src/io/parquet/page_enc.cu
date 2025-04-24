@@ -465,13 +465,18 @@ CUDF_KERNEL void __launch_bounds__(block_size)
                            device_span<parquet_column_device_view const> col_desc,
                            device_span<partition_info const> partitions,
                            device_span<int const> part_frag_offset,
-                           uint32_t fragment_size)
+                           uint32_t fragment_size,
+                           char *name)
 {
   __shared__ __align__(16) frag_init_state_s state_g;
 
   frag_init_state_s* const s          = &state_g;
   auto const t                        = threadIdx.x;
   auto const num_fragments_per_column = frag.size().second;
+
+  if(t == 0){
+    printf("GIRF0(%s, %d %d): %d\n", name, blockIdx.x, blockIdx.y, (int)num_fragments_per_column);
+  }
 
   if (t == 0) { s->col = col_desc[blockIdx.x]; }
   __syncthreads();
@@ -499,9 +504,35 @@ CUDF_KERNEL void __launch_bounds__(block_size)
     }
     __syncthreads();
 
+    if(t == 0){
+      printf("GIRF1(%s %d %d): %d %lu %u %u %u %u %u %u %d %d %d \n", name, blockIdx.x, blockIdx.y, (int)s->frag.start_row, (uint64_t)s->frag.chunk,
+        s->frag.fragment_data_size,
+        s->frag.dict_data_size,
+        s->frag.num_values,
+        s->frag.start_value_idx,
+        s->frag.num_leaf_values,
+        s->frag.num_valid,
+        s->frag.start_row,
+        (int)s->frag.num_rows,
+        (int)s->frag.num_dict_vals);
+    }
+
     calculate_frag_size<block_size>(s, t, true);
     __syncthreads();
-    if (t == 0) { frag[blockIdx.x][frag_y] = s->frag; }
+    if (t == 0) { 
+      printf("GIRF2(%s %d %d): %d %lu %u %u %u %u %u %u %d %d %d \n", name, blockIdx.x, blockIdx.y, (int)s->frag.start_row, (uint64_t)s->frag.chunk,
+        s->frag.fragment_data_size,
+        s->frag.dict_data_size,
+        s->frag.num_values,
+        s->frag.start_value_idx,
+        s->frag.num_leaf_values,
+        s->frag.num_valid,
+        s->frag.start_row,
+        (int)s->frag.num_rows,
+        (int)s->frag.num_dict_vals);
+
+      frag[blockIdx.x][frag_y] = s->frag; 
+    }
   }
 }
 
@@ -3433,14 +3464,35 @@ void InitRowGroupFragments(device_2dspan<PageFragment> frag,
                            device_span<partition_info const> partitions,
                            device_span<int const> part_frag_offset,
                            uint32_t fragment_size,
-                           rmm::cuda_stream_view stream)
+                           rmm::cuda_stream_view stream,
+                           std::string const& name)
 {
   auto const num_columns              = frag.size().first;
   auto const num_fragments_per_column = frag.size().second;
   auto const grid_y = std::min(static_cast<uint32_t>(num_fragments_per_column), MAX_GRID_Y_SIZE);
   dim3 const dim_grid(num_columns, grid_y);  // 1 threadblock per fragment
+  fprintf(stderr, "IRG(%s): dim %d %d %d\n", name.c_str(), (int)dim_grid.x, (int)dim_grid.y, (int)dim_grid.z);
+
+  auto temp_mr = cudf::get_current_device_resource_ref();
+  size_t nc = strlen(name.c_str()) + 1;
+  rmm::device_uvector<char> d_name(nc, stream, temp_mr);
+  cudaMemcpyAsync(d_name.data(), name.c_str(), nc, cudaMemcpyHostToDevice, stream);
+  stream.synchronize();
+  auto err = cudaGetLastError();
+  if(err != cudaSuccess){
+    fprintf(stderr, "Cuda had errors before gpuInitRowGroupFragments!\n");
+  }
   gpuInitRowGroupFragments<512><<<dim_grid, 512, 0, stream.value()>>>(
-    frag, col_desc, partitions, part_frag_offset, fragment_size);
+    frag, col_desc, partitions, part_frag_offset, fragment_size, d_name.data());
+  auto err2 = cudaGetLastError();
+  if(err2 != cudaSuccess){
+    fprintf(stderr, "Error launching gpuInitRowGroupFragments!\n");
+  }
+  stream.synchronize();
+  auto err3 = cudaGetLastError();
+  if(err3 != cudaSuccess){
+    fprintf(stderr, "Error synchronizing after gpuInitRowGroupFragments!\n");
+  }
 }
 
 void CalculatePageFragments(device_span<PageFragment> frag,

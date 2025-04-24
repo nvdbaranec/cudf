@@ -970,7 +970,8 @@ void InitRowGroupFragments(cudf::detail::device_2dspan<PageFragment> frag,
                            device_span<partition_info const> partitions,
                            device_span<int const> first_frag_in_part,
                            uint32_t fragment_size,
-                           rmm::cuda_stream_view stream);
+                           rmm::cuda_stream_view stream,
+                           std::string const& name);
 
 /**
  * @brief Launches kernel for calculating encoder page fragments with variable fragment sizes
