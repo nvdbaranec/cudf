@@ -1645,6 +1645,23 @@ std::string write_binary(table_view const& input,
   return {fname};
 }
 
+/*
+void compare_metadata(table_input_metadata const& a, table_input_metadata const& b)
+{
+  if(a.size() != b.size()){
+    fprintf(stderr, "Table metadata column_metadata size mismatch (%lu %d)\n", a.size(), b.size());
+  }
+  // CUDF_EXPECTS(a.size() == b.size(), "Table metadata column_metadata size mismatch");
+  for(size_t idx=0; idx<a.size(); idx++){
+    auto const& ac = a[idx];
+    auto const& bc = b[idx];
+    if(ac._nullable != bc._nullable){
+      fprintf(stderr, "Column(%lu) md mismatch: _nullable (%d %d)\n");
+    }
+  }
+}
+*/
+
 /**
  * @brief Perform the processing steps needed to convert the input table into the output Parquet
  * data for writing, such as compression and encoding.
@@ -1700,6 +1717,14 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                                    rmm::cuda_stream_view stream)
 {
   auto pqbin_name = write_binary(input, stream);
+
+//  auto meta_compare = std::make_unique<table_input_metadata>(input);  
+//  fill_table_meta(*meta_compare);
+//  compare_metadata(table_meta, *meta_compare);
+  printf("PINFO(%s): num partitions(%d)\n", pqbin_name.c_str(), (int)partitions.size());
+  for(size_t idx=0; idx<partitions.size(); idx++){
+    printf("PINFO(%s): partition(%d %d->%d)\n", pqbin_name.c_str(), (int)idx, partitions[idx].start_row, partitions[idx].num_rows);
+  }
 
   // initialize LinkedColVector
   auto vec = table_to_linked_columns(input);
