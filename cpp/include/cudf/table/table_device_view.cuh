@@ -262,7 +262,7 @@ auto contiguous_copy_column_device_views(HostTableView source_view, rmm::cuda_st
   // ColumnDeviceViews so the column can set the pointer(s) for any
   // of its child objects.
   // align both h_ptr, d_ptr
-  auto descendant_storage = std::make_unique<rmm::device_buffer>(padded_views_size_bytes, stream);
+  auto descendant_storage = std::make_unique<rmm::device_buffer>(padded_views_size_bytes, stream, cudf::get_current_device_resource_ref());
   void* h_ptr             = detail::align_ptr_for_type<ColumnDeviceView>(h_buffer.data());
   void* d_ptr    = detail::align_ptr_for_type<ColumnDeviceView>(descendant_storage->data());
   auto d_columns = detail::child_columns_to_device_array<ColumnDeviceView>(

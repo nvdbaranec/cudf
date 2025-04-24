@@ -30,16 +30,19 @@ namespace cudf::detail {
 namespace {
 
 // Simple kernel to copy between device buffers
+/*
 CUDF_KERNEL void copy_kernel(char const* __restrict__ src, char* __restrict__ dst, size_t n)
 {
   auto const idx = cudf::detail::grid_1d::global_thread_id();
   if (idx < n) { dst[idx] = src[idx]; }
 }
+*/
 
 void copy_pinned(void* dst, void const* src, std::size_t size, rmm::cuda_stream_view stream)
 {
   if (size == 0) return;
 
+  /*
   if (size < get_kernel_pinned_copy_threshold()) {
     const int block_size = 256;
     auto const grid_size = cudf::util::div_rounding_up_safe<size_t>(size, block_size);
@@ -47,7 +50,9 @@ void copy_pinned(void* dst, void const* src, std::size_t size, rmm::cuda_stream_
     // thrust function can potentially call cudaMemcpyAsync instead of using a kernel
     copy_kernel<<<grid_size, block_size, 0, stream.value()>>>(
       static_cast<char const*>(src), static_cast<char*>(dst), size);
-  } else {
+  } else 
+  */
+  {
     CUDF_CUDA_TRY(cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream));
   }
 }

@@ -53,7 +53,7 @@ class hostdevice_vector {
   }
 
   explicit hostdevice_vector(size_t initial_size, size_t max_size, rmm::cuda_stream_view stream)
-    : h_data{make_pinned_vector_async<T>(0, stream)}, d_data(max_size, stream)
+    : h_data{make_pinned_vector_async<T>(0, stream)}, d_data(max_size, stream, cudf::get_current_device_resource_ref())
   {
     CUDF_EXPECTS(initial_size <= max_size, "initial_size cannot be larger than max_size");
 

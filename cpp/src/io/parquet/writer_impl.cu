@@ -1135,10 +1135,14 @@ void init_row_group_fragments(cudf::detail::hostdevice_2dvector<PageFragment>& f
                               rmm::cuda_stream_view stream,
                               std::string const& name)
 {
+  cudaDeviceSynchronize();
   auto d_partitions = cudf::detail::make_device_uvector_async(
     partitions, stream, cudf::get_current_device_resource_ref());
+  cudaDeviceSynchronize();
   InitRowGroupFragments(frag, col_desc, d_partitions, part_frag_offset, fragment_size, stream, name);
+  cudaDeviceSynchronize();
   frag.device_to_host(stream);
+  cudaDeviceSynchronize();
 }
 
 /**
@@ -1857,7 +1861,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   // can be written into col_desc members
   // These are unused but needs to be kept alive.
   auto parent_column_table_device_view = table_device_view::create(single_streams_table, stream);
-  rmm::device_uvector<column_device_view> leaf_column_views(0, stream);
+  rmm::device_uvector<column_device_view> leaf_column_views(0, stream, cudf::get_current_device_resource_ref());
 
   if (num_fragments != 0) {
     // Move column info to device
