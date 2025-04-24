@@ -1851,6 +1851,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
       row_group_fragments[x_idx][y_idx].chunk = nullptr;
     }
   }
+  row_group_fragments.host_to_device(stream);
 
   // Create table_device_view so that corresponding column_device_view data
   // can be written into col_desc members
@@ -1985,10 +1986,14 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
         ck.first_fragment    = c * num_fragments + f;
         ck.encodings         = 0;
         auto chunk_fragments = row_group_fragments[c].subspan(f, fragments_in_chunk);
+        fprintf(stderr, "CF(%s)(%d %d %d): %d %d %d %lu %d\n", pqbin_name.c_str(), (int)p, (int)r, (int)c, (int)f, (int)fragments_in_chunk, (int)first_rg_in_part[p], global_r, (int)chunk_fragments.size());
         // In fragment struct, add a pointer to the chunk it belongs to
         // In each fragment in chunk_fragments, update the chunk pointer here.
         for (auto& frag : chunk_fragments) {
           frag.chunk = &chunks.device_view()[r + first_rg_in_part[p]][c];
+          if(frag.chunk == nullptr){
+            fprintf(stderr, "Null chunk ptr(%s): %d %d %d %d\n", pqbin_name.c_str(), (int)r, (int)p, (int)c, (int)first_rg_in_part[p]);
+          }
         }
         ck.num_values = std::accumulate(
           chunk_fragments.begin(), chunk_fragments.end(), 0, [](uint32_t l, auto r) {
@@ -2015,7 +2020,18 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   for(size_t x_idx=0; x_idx<row_group_fragments.size().first; x_idx++){
     for(size_t y_idx=0; y_idx<row_group_fragments.size().second; y_idx++){
       if(row_group_fragments[x_idx][y_idx].chunk == nullptr){
-        fprintf(stderr, "(%s) Null rg fragment: %lu %lu %d\n", pqbin_name.c_str(), x_idx, y_idx, num_fragments);
+        auto const &f = row_group_fragments[x_idx][y_idx];
+        fprintf(stderr, "(%s) Null rg fragment: %lu %lu %d %u %u %u %u %u %u %d %d %d\n", pqbin_name.c_str(), x_idx, y_idx, num_fragments,
+          f.fragment_data_size,
+          f.dict_data_size,
+          f.num_values,
+          f.start_value_idx,
+          f.num_leaf_values,
+          f.num_valid,
+          f.start_row,
+          (int)f.num_rows,
+          (int)f.num_dict_vals
+        );
       }
       //CUDF_EXPECTS(row_group_fragments[x_idx][y_idx].chunk != nullptr, "Unexpected null rg fragment!");
       if(row_group_fragments[x_idx][y_idx].chunk == sentinel){
