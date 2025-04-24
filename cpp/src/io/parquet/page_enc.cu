@@ -519,19 +519,20 @@ CUDF_KERNEL void __launch_bounds__(block_size)
 
     calculate_frag_size<block_size>(s, t, true);
     __syncthreads();
-    if (t == 0) { 
-      printf("GIRF2(%s %d %d): %d %lu %u %u %u %u %u %u %d %d %d \n", name, blockIdx.x, blockIdx.y, (int)s->frag.start_row, (uint64_t)s->frag.chunk,
-        s->frag.fragment_data_size,
-        s->frag.dict_data_size,
-        s->frag.num_values,
-        s->frag.start_value_idx,
-        s->frag.num_leaf_values,
-        s->frag.num_valid,
-        s->frag.start_row,
-        (int)s->frag.num_rows,
-        (int)s->frag.num_dict_vals);
-
+    if (t == 0) {
       frag[blockIdx.x][frag_y] = s->frag; 
+
+      auto const& f = frag[blockIdx.x][frag_y];
+      printf("GIRF2(%s %d %d): %d %lu %u %u %u %u %u %u %d %d %d \n", name, blockIdx.x, blockIdx.y, (int)f.start_row, (uint64_t)f.chunk,
+        f.fragment_data_size,
+        f.dict_data_size,
+        f.num_values,
+        f.start_value_idx,
+        f.num_leaf_values,
+        f.num_valid,
+        f.start_row,
+        (int)f.num_rows,
+        (int)f.num_dict_vals);
     }
   }
 }
