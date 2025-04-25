@@ -1027,7 +1027,8 @@ void InitEncoderPages(cudf::detail::device_2dspan<EncColumnChunk> chunks,
                       bool write_v2_headers,
                       statistics_merge_group* page_grstats,
                       statistics_merge_group* chunk_grstats,
-                      rmm::cuda_stream_view stream);
+                      rmm::cuda_stream_view stream,
+                      std::string const& name);
 
 /**
  * @brief Launches kernel for packing column data into parquet pages

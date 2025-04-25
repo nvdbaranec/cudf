@@ -1134,15 +1134,44 @@ void init_row_group_fragments(cudf::detail::hostdevice_2dvector<PageFragment>& f
                               uint32_t fragment_size,
                               rmm::cuda_stream_view stream,
                               std::string const& name)
-{
-  cudaDeviceSynchronize();
+{  
   auto d_partitions = cudf::detail::make_device_uvector_async(
-    partitions, stream, cudf::get_current_device_resource_ref());
-  cudaDeviceSynchronize();
-  InitRowGroupFragments(frag, col_desc, d_partitions, part_frag_offset, fragment_size, stream, name);
-  cudaDeviceSynchronize();
-  frag.device_to_host(stream);
-  cudaDeviceSynchronize();
+    partitions, stream, cudf::get_current_device_resource_ref());  
+  InitRowGroupFragments(frag, col_desc, d_partitions, part_frag_offset, fragment_size, stream, name);  
+  frag.device_to_host(stream);  
+  
+  std::vector<PageFragment> h_frag(frag.size().first * frag.size().second);
+  cudaMemcpyAsync(h_frag.data(), frag.base_device_ptr(), sizeof(PageFragment) * h_frag.size(), cudaMemcpyDeviceToHost);
+  stream.synchronize();
+  auto* d_frag = frag.base_host_ptr();
+  for(size_t idx=0; idx<h_frag.size(); idx++){  
+    auto const& a = d_frag[idx];
+    auto const& b = h_frag[idx];
+    if(a.fragment_data_size != b.fragment_data_size){
+      fprintf(stderr, "Host mismatch (fragment_data_size): %u %u\n", a.fragment_data_size, b.fragment_data_size);
+    }
+    if(a.dict_data_size != b.dict_data_size){
+      fprintf(stderr, "Host mismatch (dict_data_size): %u %u\n", a.dict_data_size, b.dict_data_size);
+    }
+    if(a.num_values != b.num_values){
+      fprintf(stderr, "Host mismatch (num_values): %u %u\n", a.num_values, b.num_values);
+    }
+    if(a.start_value_idx != b.start_value_idx){
+      fprintf(stderr, "Host mismatch (start_value_idx): %u %u\n", a.start_value_idx, b.start_value_idx);
+    }
+    if(a.num_leaf_values != b.num_leaf_values){
+      fprintf(stderr, "Host mismatch (num_leaf_values): %u %u\n", a.num_leaf_values, b.num_leaf_values);
+    }
+    if(a.start_row != b.start_row){
+      fprintf(stderr, "Host mismatch (start_row): %u %u\n", a.start_row, b.start_row);
+    }
+    if(a.num_rows != b.num_rows){
+      fprintf(stderr, "Host mismatch (num_rows): %d %d\n", (int)a.num_rows, (int)b.num_rows);
+    }
+    if(a.num_dict_vals != b.num_dict_vals){
+      fprintf(stderr, "Host mismatch (num_dict_vals): %u %u\n", (int)a.num_dict_vals, (int)b.num_dict_vals);
+    }
+  }
 }
 
 /**
@@ -1191,7 +1220,8 @@ auto init_page_sizes(hostdevice_2dvector<EncColumnChunk>& chunks,
                      size_type max_page_size_rows,
                      bool write_v2_headers,
                      compression_type compression,
-                     rmm::cuda_stream_view stream)
+                     rmm::cuda_stream_view stream,
+                     std::string const& name)
 {
   if (chunks.is_empty()) { return cudf::detail::hostdevice_vector<size_type>{}; }
 
@@ -1209,7 +1239,8 @@ auto init_page_sizes(hostdevice_2dvector<EncColumnChunk>& chunks,
                    write_v2_headers,
                    nullptr,
                    nullptr,
-                   stream);
+                   stream,
+                   name + " A");
   chunks.device_to_host(stream);
 
   int num_pages = 0;
@@ -1234,7 +1265,8 @@ auto init_page_sizes(hostdevice_2dvector<EncColumnChunk>& chunks,
                    write_v2_headers,
                    nullptr,
                    nullptr,
-                   stream);
+                   stream,
+                   name + " B");
   page_sizes.device_to_host(stream);
 
   // Get per-page max compressed size
@@ -1258,7 +1290,8 @@ auto init_page_sizes(hostdevice_2dvector<EncColumnChunk>& chunks,
                    write_v2_headers,
                    nullptr,
                    nullptr,
-                   stream);
+                   stream,
+                   name + " C");
   chunks.device_to_host(stream);
   return comp_page_sizes;
 }
@@ -1464,7 +1497,8 @@ void init_encoder_pages(hostdevice_2dvector<EncColumnChunk>& chunks,
                         size_t max_page_size_bytes,
                         size_type max_page_size_rows,
                         bool write_v2_headers,
-                        rmm::cuda_stream_view stream)
+                        rmm::cuda_stream_view stream,
+                        std::string const& name)
 {
   rmm::device_uvector<statistics_merge_group> page_stats_mrg(num_stats_bfr, stream);
   chunks.host_to_device_async(stream);
@@ -1480,7 +1514,8 @@ void init_encoder_pages(hostdevice_2dvector<EncColumnChunk>& chunks,
                    write_v2_headers,
                    (num_stats_bfr) ? page_stats_mrg.data() : nullptr,
                    (num_stats_bfr > num_pages) ? page_stats_mrg.data() + num_pages : nullptr,
-                   stream);
+                   stream,
+                   name + " Z");
   if (num_stats_bfr > 0) {
     detail::merge_group_statistics<detail::io_file_format::PARQUET>(
       page_stats, frag_stats, page_stats_mrg.data(), num_pages, stream);
@@ -1625,9 +1660,16 @@ size_t column_index_buffer_size(EncColumnChunk* ck,
   return ck->ck_stat_size * num_pages + column_index_truncate_length + padding + size_struct_size;
 }
 
+
 std::string write_binary(table_view const& input,
                          rmm::cuda_stream_view stream)
 {
+  char fname[512] = "/tmp/pqbin_XXXXXX";
+  int f = mkstemp(fname);
+  close(f);
+  return {fname};
+
+  /*
   auto packed = cudf::pack(input, stream, cudf::get_current_device_resource_ref());
   char fname[512] = "/tmp/pqbin_XXXXXX";
   int f = mkstemp(fname);
@@ -1646,9 +1688,11 @@ std::string write_binary(table_view const& input,
   stream.synchronize();
   write(f, h_gpu_data.data(), gpu_size);
   close(f);
+  */
 
   return {fname};
 }
+
 
 /*
 void compare_metadata(table_input_metadata const& a, table_input_metadata const& b)
@@ -1833,7 +1877,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                  });
 
   size_type num_fragments = std::reduce(num_frag_in_part.begin(), num_frag_in_part.end());
-  fprintf(stderr, "(%s) max_page_fragment_size: %d  num_fragments: %d  num_columns: %d\n", pqbin_name.c_str(), max_page_fragment_size, num_fragments, (int)num_columns);
+//  fprintf(stderr, "(%s) max_page_fragment_size: %d  num_fragments: %d  num_columns: %d\n", pqbin_name.c_str(), max_page_fragment_size, num_fragments, (int)num_columns);
 
   auto part_frag_offset =
     cudf::detail::make_empty_host_vector<int>(num_frag_in_part.size() + 1, stream);
@@ -1869,7 +1913,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     leaf_column_views = create_leaf_column_device_views<parquet_column_device_view>(
       col_desc, *parent_column_table_device_view, stream);
 
-    fprintf(stderr, "START init_row_group_fragments (%s)\n", pqbin_name.c_str());
+    //fprintf(stderr, "START init_row_group_fragments (%s)\n", pqbin_name.c_str());
     init_row_group_fragments(row_group_fragments,
                              col_desc,
                              partitions,
@@ -1878,7 +1922,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                              stream,
                              pqbin_name);
     stream.synchronize();
-    fprintf(stderr, "END init_row_group_fragments (%s)\n", pqbin_name.c_str());
+    //fprintf(stderr, "END init_row_group_fragments (%s)\n", pqbin_name.c_str());
   }
 
   std::unique_ptr<aggregate_writer_metadata> agg_meta;
@@ -1990,14 +2034,16 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
         ck.first_fragment    = c * num_fragments + f;
         ck.encodings         = 0;
         auto chunk_fragments = row_group_fragments[c].subspan(f, fragments_in_chunk);
-        fprintf(stderr, "CF(%s)(%d %d %d): %d %d %d %lu %d\n", pqbin_name.c_str(), (int)p, (int)r, (int)c, (int)f, (int)fragments_in_chunk, (int)first_rg_in_part[p], global_r, (int)chunk_fragments.size());
+        // fprintf(stderr, "CF(%s)(%d %d %d): %d %d %d %lu %d\n", pqbin_name.c_str(), (int)p, (int)r, (int)c, (int)f, (int)fragments_in_chunk, (int)first_rg_in_part[p], global_r, (int)chunk_fragments.size());
         // In fragment struct, add a pointer to the chunk it belongs to
         // In each fragment in chunk_fragments, update the chunk pointer here.
         for (auto& frag : chunk_fragments) {
           frag.chunk = &chunks.device_view()[r + first_rg_in_part[p]][c];
+          /*
           if(frag.chunk == nullptr){
             fprintf(stderr, "Null chunk ptr(%s): %d %d %d %d\n", pqbin_name.c_str(), (int)r, (int)p, (int)c, (int)first_rg_in_part[p]);
           }
+          */
         }
         ck.num_values = std::accumulate(
           chunk_fragments.begin(), chunk_fragments.end(), 0, [](uint32_t l, auto r) {
@@ -2051,11 +2097,11 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   }
 
   row_group_fragments.host_to_device_async(stream);
-  fprintf(stderr, "START build_chunk_dictionaries (%s)\n", pqbin_name.c_str());
+  //fprintf(stderr, "START build_chunk_dictionaries (%s)\n", pqbin_name.c_str());
   [[maybe_unused]] auto dict_info_owner = build_chunk_dictionaries(
     chunks, col_desc, row_group_fragments, compression, dict_policy, max_dictionary_size, stream);
   stream.synchronize();
-  fprintf(stderr, "END build_chunk_dictionaries (%s)\n", pqbin_name.c_str());
+  //fprintf(stderr, "END build_chunk_dictionaries (%s)\n", pqbin_name.c_str());
 
   // The code preceding this used a uniform fragment size for all columns. Now recompute
   // fragments with a (potentially) varying number of fragments per column.
@@ -2153,7 +2199,8 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                                          max_page_size_rows,
                                          write_v2_headers,
                                          compression,
-                                         stream);
+                                         stream,
+                                         pqbin_name);
 
   // Find which partition a rg belongs to
   std::vector<int> rg_to_part;
@@ -2266,7 +2313,8 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
                        max_page_size_bytes,
                        max_page_size_rows,
                        write_v2_headers,
-                       stream);
+                       stream,
+                       pqbin_name);
   }
 
   // Check device write support for all chunks and initialize bounce_buffer.

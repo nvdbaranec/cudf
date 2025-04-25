@@ -474,9 +474,11 @@ CUDF_KERNEL void __launch_bounds__(block_size)
   auto const t                        = threadIdx.x;
   auto const num_fragments_per_column = frag.size().second;
 
+  /*
   if(t == 0){
     printf("GIRF0(%s, %d %d): %d\n", name, blockIdx.x, blockIdx.y, (int)num_fragments_per_column);
   }
+  */
 
   if (t == 0) { s->col = col_desc[blockIdx.x]; }
   __syncthreads();
@@ -504,6 +506,7 @@ CUDF_KERNEL void __launch_bounds__(block_size)
     }
     __syncthreads();
 
+    /*
     if(t == 0){
       printf("GIRF1(%s %d %d): %d %lu %u %u %u %u %u %u %d %d %d \n", name, blockIdx.x, blockIdx.y, (int)s->frag.start_row, (uint64_t)s->frag.chunk,
         s->frag.fragment_data_size,
@@ -516,12 +519,14 @@ CUDF_KERNEL void __launch_bounds__(block_size)
         (int)s->frag.num_rows,
         (int)s->frag.num_dict_vals);
     }
+    */
 
     calculate_frag_size<block_size>(s, t, true);
     __syncthreads();
     if (t == 0) {
       frag[blockIdx.x][frag_y] = s->frag; 
 
+      /*
       auto const& f = frag[blockIdx.x][frag_y];
       printf("GIRF2(%s %d %d): %d %lu %u %u %u %u %u %u %d %d %d \n", name, blockIdx.x, blockIdx.y, (int)f.start_row, (uint64_t)f.chunk,
         f.fragment_data_size,
@@ -533,6 +538,7 @@ CUDF_KERNEL void __launch_bounds__(block_size)
         f.start_row,
         (int)f.num_rows,
         (int)f.num_dict_vals);
+        */
     }
   }
 }
@@ -709,7 +715,8 @@ CUDF_KERNEL void __launch_bounds__(128)
                size_t max_page_size_bytes,
                size_type max_page_size_rows,
                uint32_t page_align,
-               bool write_v2_headers)
+               bool write_v2_headers,
+               char *name)
 {
   // TODO: All writing seems to be done by thread 0. Could be replaced by thrust foreach
   __shared__ __align__(8) parquet_column_device_view col_g;
@@ -723,6 +730,17 @@ CUDF_KERNEL void __launch_bounds__(128)
 
   // Max page header size excluding statistics
   auto const max_data_page_hdr_size = write_v2_headers ? MAX_V2_HDR_SIZE : MAX_V1_HDR_SIZE;
+
+  if(t == 0 && blockIdx.x == 0 && blockIdx.y == 0){
+    printf("GIP(%s)(%d %d): %lu, %lu, %lu, %lu, %lu %lu %lu\n", name, (int)blockIdx.x, (int)blockIdx.y,
+      (uint64_t)chunks.flat_view().data(),
+      (uint64_t)pages.data(),
+      (uint64_t)page_sizes.data(),
+      (uint64_t)comp_page_sizes.data(),
+      (uint64_t)col_desc.data(),
+      (uint64_t)page_grstats,
+      (uint64_t)chunk_grstats);
+  }
 
   if (t == 0) {
     col_g  = col_desc[blockIdx.x];
@@ -800,8 +818,11 @@ CUDF_KERNEL void __launch_bounds__(128)
       if (t == 0) {
         if (not pages.empty()) {
           page_g.kernel_mask     = encode_kernel_mask::PLAIN;
+          if(ck_g.first_page >= pages.size()){
+            printf("(%s) Out of bounds index writing pages (A, %d %d): %u %d\n", name, (int)blockIdx.x, (int)blockIdx.y, ck_g.first_page, (int)pages.size());
+          }
           pages[ck_g.first_page] = page_g;
-        }
+        }        
         if (not page_sizes.empty()) { page_sizes[ck_g.first_page] = page_g.max_data_size; }
         if (page_grstats) { page_grstats[ck_g.first_page] = pagestats_g; }
       }
@@ -976,6 +997,9 @@ CUDF_KERNEL void __launch_bounds__(128)
             if (ck_g.rep_histogram_data != nullptr && col_g.max_rep_level > 0) {
               page_g.rep_histogram =
                 ck_g.rep_histogram_data + num_histograms * (col_g.max_rep_level + 1);
+            }
+            if(ck_g.first_page + num_pages > pages.size()){      
+              printf("(%s) Out of bounds index writing pages (B, %d %d): %u %d\n", name, (int)blockIdx.x, (int)blockIdx.y, ck_g.first_page + num_pages, (int)pages.size());
             }
             pages[ck_g.first_page + num_pages] = page_g;
           }
@@ -3525,8 +3549,15 @@ void InitEncoderPages(device_2dspan<EncColumnChunk> chunks,
                       bool write_v2_headers,
                       statistics_merge_group* page_grstats,
                       statistics_merge_group* chunk_grstats,
-                      rmm::cuda_stream_view stream)
+                      rmm::cuda_stream_view stream,
+                      std::string const& name)
 {
+  auto temp_mr = cudf::get_current_device_resource_ref();
+  size_t nc = strlen(name.c_str()) + 1;
+  rmm::device_uvector<char> d_name(nc, stream, temp_mr);
+  cudaMemcpyAsync(d_name.data(), name.c_str(), nc, cudaMemcpyHostToDevice, stream);
+  stream.synchronize();
+
   auto num_rowgroups = chunks.size().first;
   dim3 dim_grid(num_columns, num_rowgroups);  // 1 threadblock per rowgroup
   gpuInitPages<<<dim_grid, encode_block_size, 0, stream.value()>>>(chunks,
@@ -3540,7 +3571,8 @@ void InitEncoderPages(device_2dspan<EncColumnChunk> chunks,
                                                                    max_page_size_bytes,
                                                                    max_page_size_rows,
                                                                    page_align,
-                                                                   write_v2_headers);
+                                                                   write_v2_headers,
+                                                                   d_name.data());
 }
 
 void EncodePages(device_span<EncPage> pages,

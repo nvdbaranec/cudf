@@ -409,6 +409,9 @@ struct device_span : public cudf::detail::span_base<T, Extent, device_span<T, Ex
   __device__ constexpr typename base::reference operator[](typename base::size_type idx) const
   {
     static_assert(sizeof(idx) >= sizeof(size_t), "index type must not be smaller than size_t");
+    if(idx >= this->_size){
+      printf("Invalid device_span access (%lu / %lu)\n", (size_t)idx, (size_t)this->_size);
+    }    
     return this->_data[idx];
   }
 
@@ -519,6 +522,9 @@ class base_2dspan {
    */
   CUDF_HOST_DEVICE constexpr RowType<T, dynamic_extent> operator[](std::size_t row) const
   {
+    if(row >= _size.first){
+      printf("Invalid device_span2d access x (%lu / %lu)\n", row, _size.first);
+    }
     return _flat.subspan(row * _size.second, _size.second);
   }
 
