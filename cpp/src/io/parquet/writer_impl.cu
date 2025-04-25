@@ -1141,7 +1141,7 @@ void init_row_group_fragments(cudf::detail::hostdevice_2dvector<PageFragment>& f
   frag.device_to_host(stream);  
   
   std::vector<PageFragment> h_frag(frag.size().first * frag.size().second);
-  cudaMemcpyAsync(h_frag.data(), frag.base_device_ptr(), sizeof(PageFragment) * h_frag.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpyAsync(h_frag.data(), frag.base_device_ptr(), sizeof(PageFragment) * h_frag.size(), cudaMemcpyDeviceToHost, stream);
   stream.synchronize();
   auto* d_frag = frag.base_host_ptr();
   for(size_t idx=0; idx<h_frag.size(); idx++){  
@@ -2448,8 +2448,9 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     }
   }
 
-  auto bounce_buffer =
-    cudf::detail::make_pinned_vector_async<uint8_t>(all_device_write ? 0 : max_write_size, stream);
+  //auto bounce_buffer =
+    //cudf::detail::make_pinned_vector_async<uint8_t>(all_device_write ? 0 : max_write_size, stream);
+  std::vector<uint8_t> bounce_buffer(all_device_write ? 0 : max_write_size);
 
   return std::tuple{std::move(agg_meta),
                     std::move(pages),
