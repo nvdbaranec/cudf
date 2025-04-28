@@ -143,7 +143,8 @@ static_assert(cuda::mr::resource_with<fixed_pinned_pool_memory_resource,
 CUDF_EXPORT rmm::host_device_async_resource_ref& make_default_pinned_mr(
   std::optional<size_t> config_size)
 {
-  static fixed_pinned_pool_memory_resource mr = [config_size]() {
+  static rmm::mr::pinned_host_memory_resource mr = [config_size]() {
+  /*
     auto const size = [&config_size]() -> size_t {
       if (auto const env_val = getenv("LIBCUDF_PINNED_POOL_SIZE"); env_val != nullptr) {
         return std::atol(env_val);
@@ -155,9 +156,10 @@ CUDF_EXPORT rmm::host_device_async_resource_ref& make_default_pinned_mr(
       // 0.5% of the total device memory, capped at 100MB
       return std::min(total / 200, size_t{100} * 1024 * 1024);
     }();
+    */
 
     // make the pool with max size equal to the initial size
-    return fixed_pinned_pool_memory_resource{size};
+    return rmm::mr::pinned_host_memory_resource{};
   }();
 
   static rmm::host_device_async_resource_ref mr_ref{mr};
