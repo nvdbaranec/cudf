@@ -63,6 +63,13 @@
 #error "CUDF_VERSION is not defined"
 #endif
 
+namespace cudf::detail {
+  extern thread_local bool pinned_debug;
+  extern thread_local void* expected_dst;
+  extern thread_local void* expected_src;
+  extern thread_local size_t expected_size;
+}
+
 namespace cudf::io::parquet::detail {
 
 using namespace cudf::io::detail;
@@ -1134,42 +1141,52 @@ void init_row_group_fragments(cudf::detail::hostdevice_2dvector<PageFragment>& f
                               uint32_t fragment_size,
                               rmm::cuda_stream_view stream,
                               std::string const& name)
-{  
+{
+  auto const num_elements = frag.size().first * frag.size().second;
+  auto const data_size = num_elements * sizeof(PageFragment);
+
+  cudf::detail::expected_dst = frag.base_host_ptr();
+  cudf::detail::expected_src = frag.base_device_ptr();
+  cudf::detail::expected_size = data_size;
+
   auto d_partitions = cudf::detail::make_device_uvector_async(
-    partitions, stream, cudf::get_current_device_resource_ref());  
-  InitRowGroupFragments(frag, col_desc, d_partitions, part_frag_offset, fragment_size, stream, name);  
-  frag.device_to_host(stream);  
-  
-  std::vector<PageFragment> h_frag(frag.size().first * frag.size().second);
-  cudaMemcpyAsync(h_frag.data(), frag.base_device_ptr(), sizeof(PageFragment) * h_frag.size(), cudaMemcpyDeviceToHost, stream);
+    partitions, stream, cudf::get_current_device_resource_ref());
+  InitRowGroupFragments(frag, col_desc, d_partitions, part_frag_offset, fragment_size, stream, name);
+  cudf::detail::pinned_debug = true;
+  frag.device_to_host(stream);
+  cudf::detail::pinned_debug = false;
+
+  std::vector<PageFragment> h_frag(num_elements);
+  cudaMemcpyAsync(h_frag.data(), frag.base_device_ptr(), data_size, cudaMemcpyDeviceToHost, stream);
   stream.synchronize();
   auto* d_frag = frag.base_host_ptr();
+  auto const pt = pthread_self();
   for(size_t idx=0; idx<h_frag.size(); idx++){  
     auto const& a = d_frag[idx];
     auto const& b = h_frag[idx];
     if(a.fragment_data_size != b.fragment_data_size){
-      fprintf(stderr, "Host mismatch (fragment_data_size): %u %u\n", a.fragment_data_size, b.fragment_data_size);
+      fprintf(stderr, "Host mismatch (%lu) (fragment_data_size): %u %u\n", (uint64_t)pt, a.fragment_data_size, b.fragment_data_size);
     }
     if(a.dict_data_size != b.dict_data_size){
-      fprintf(stderr, "Host mismatch (dict_data_size): %u %u\n", a.dict_data_size, b.dict_data_size);
+      fprintf(stderr, "Host mismatch (%lu) (dict_data_size): %u %u\n", (uint64_t)pt, a.dict_data_size, b.dict_data_size);
     }
     if(a.num_values != b.num_values){
-      fprintf(stderr, "Host mismatch (num_values): %u %u\n", a.num_values, b.num_values);
+      fprintf(stderr, "Host mismatch (%lu) (num_values): %u %u\n", (uint64_t)pt, a.num_values, b.num_values);
     }
     if(a.start_value_idx != b.start_value_idx){
-      fprintf(stderr, "Host mismatch (start_value_idx): %u %u\n", a.start_value_idx, b.start_value_idx);
+      fprintf(stderr, "Host mismatch (%lu) (start_value_idx): %u %u\n", (uint64_t)pt, a.start_value_idx, b.start_value_idx);
     }
     if(a.num_leaf_values != b.num_leaf_values){
-      fprintf(stderr, "Host mismatch (num_leaf_values): %u %u\n", a.num_leaf_values, b.num_leaf_values);
+      fprintf(stderr, "Host mismatch (%lu) (num_leaf_values): %u %u\n", (uint64_t)pt, a.num_leaf_values, b.num_leaf_values);
     }
     if(a.start_row != b.start_row){
-      fprintf(stderr, "Host mismatch (start_row): %u %u\n", a.start_row, b.start_row);
+      fprintf(stderr, "Host mismatch (%lu) (start_row): %u %u\n", (uint64_t)pt, a.start_row, b.start_row);
     }
     if(a.num_rows != b.num_rows){
-      fprintf(stderr, "Host mismatch (num_rows): %d %d\n", (int)a.num_rows, (int)b.num_rows);
+      fprintf(stderr, "Host mismatch (%lu) (num_rows): %d %d\n", (uint64_t)pt, (int)a.num_rows, (int)b.num_rows);
     }
     if(a.num_dict_vals != b.num_dict_vals){
-      fprintf(stderr, "Host mismatch (num_dict_vals): %u %u\n", (int)a.num_dict_vals, (int)b.num_dict_vals);
+      fprintf(stderr, "Host mismatch (%lu) (num_dict_vals): %u %u\n", (uint64_t)pt, (int)a.num_dict_vals, (int)b.num_dict_vals);
     }
   }
 }

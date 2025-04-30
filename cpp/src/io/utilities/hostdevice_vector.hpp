@@ -144,14 +144,8 @@ class hostdevice_vector {
     cuda_memcpy_async<T>(h_data, d_data, stream);
   }
 
-  void device_to_host(rmm::cuda_stream_view stream) { 
-    pinned_debug = true;
-    expected_dst = h_data.data();
-    expected_src = d_data.data();
-    expected_size = h_data.size() * sizeof(T);
-    CUDF_EXPECTS(expected_size == d_data.size() * sizeof(T), "Mismatch in buffer sizes!");
+  void device_to_host(rmm::cuda_stream_view stream) {
     cuda_memcpy<T>(h_data, d_data, stream);
-    pinned_debug = false;
   }
 
   /**

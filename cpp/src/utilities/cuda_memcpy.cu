@@ -45,17 +45,23 @@ CUDF_KERNEL void copy_kernel(char const* __restrict__ src, char* __restrict__ ds
 
 void copy_pinned(void* dst, void const* src, std::size_t size, rmm::cuda_stream_view stream)
 {
-  if(pinned_debug){
-    printf("copy_pinned: %lu -> %lu %lu\n", (uint64_t)dst, (uint64_t)src, size);
+  auto const pt = pthread_self();
+
+  if(dst == nullptr && src == nullptr && size == 0){    
+    printf("copy_pinned EMPTY: %lu\n", (uint64_t)pt);
+  }  
+
+  if(pinned_debug){    
+    printf("copy_pinned(%lu): %lu -> %lu %lu\n", (uint64_t)pt, (uint64_t)dst, (uint64_t)src, size);
 
     if(dst != expected_dst){
-      printf("Expected dst mismatch! %lu %lu\n", (uint64_t)dst, (uint64_t)expected_dst);
+      printf("(%lu) Expected dst mismatch! %lu %lu\n", (uint64_t)pt, (uint64_t)dst, (uint64_t)expected_dst);
     }
     if(src != expected_src){
-      printf("Expected src mismatch! %lu %lu\n", (uint64_t)src, (uint64_t)expected_src);
+      printf("(%lu) Expected src mismatch! %lu %lu\n", (uint64_t)pt, (uint64_t)src, (uint64_t)expected_src);
     }
     if(size != expected_size){
-      printf("Expected size mismatch! %lu %lu\n", (uint64_t)size, (uint64_t)expected_size);
+      printf("(%lu) Expected size mismatch! %lu %lu\n", (uint64_t)pt, (uint64_t)size, (uint64_t)expected_size);
     }
   }
 
