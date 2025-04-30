@@ -27,6 +27,11 @@
 
 namespace cudf::detail {
 
+thread_local bool pinned_debug = false;
+thread_local void* expected_dst = nullptr;
+thread_local void* expected_src = nullptr;
+thread_local size_t expected_size = 0;
+
 namespace {
 
 // Simple kernel to copy between device buffers
@@ -40,6 +45,20 @@ CUDF_KERNEL void copy_kernel(char const* __restrict__ src, char* __restrict__ ds
 
 void copy_pinned(void* dst, void const* src, std::size_t size, rmm::cuda_stream_view stream)
 {
+  if(pinned_debug){
+    printf("copy_pinned: %lu -> %lu %lu\n", (uint64_t)dst, (uint64_t)src, size);
+
+    if(dst != expected_dst){
+      printf("Expected dst mismatch! %lu %lu\n", (uint64_t)dst, (uint64_t)expected_dst);
+    }
+    if(src != expected_src){
+      printf("Expected src mismatch! %lu %lu\n", (uint64_t)src, (uint64_t)expected_src);
+    }
+    if(size != expected_size){
+      printf("Expected size mismatch! %lu %lu\n", (uint64_t)size, (uint64_t)expected_size);
+    }
+  }
+
   if (size == 0) return;
 
   /*
@@ -53,7 +72,11 @@ void copy_pinned(void* dst, void const* src, std::size_t size, rmm::cuda_stream_
   } else 
   */
   {
-    CUDF_CUDA_TRY(cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream));
+    if(pinned_debug){
+      printf("copy_pinned cudaMemcpyAsync: %lu -> %lu %lu\n", (uint64_t)dst, (uint64_t)src, size);
+    }
+    // CUDF_CUDA_TRY(cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream));
+    cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream);
   }
 }
 

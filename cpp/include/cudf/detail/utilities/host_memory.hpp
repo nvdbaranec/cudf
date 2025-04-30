@@ -40,12 +40,10 @@ CUDF_EXPORT rmm::host_async_resource_ref get_pageable_memory_resource();
  */
 template <typename T>
 rmm_host_allocator<T> get_host_allocator(std::size_t size, rmm::cuda_stream_view stream)
-{
-  /*
+{  
   if (size * sizeof(T) <= get_allocate_host_as_pinned_threshold()) {
     return {get_pinned_memory_resource(), stream};
   }
-  */
   return {get_pageable_memory_resource(), stream};
 }
 

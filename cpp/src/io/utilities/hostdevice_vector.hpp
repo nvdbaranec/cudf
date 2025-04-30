@@ -31,6 +31,12 @@
 
 namespace cudf::detail {
 
+extern thread_local bool pinned_debug;
+extern thread_local void* expected_dst;
+extern thread_local void* expected_src;
+extern thread_local size_t expected_size;
+
+
 /**
  * @brief A helper class that wraps fixed-length device memory for the GPU, and
  * a mirror host pinned memory for the CPU.
@@ -53,7 +59,7 @@ class hostdevice_vector {
   }
 
   explicit hostdevice_vector(size_t initial_size, size_t max_size, rmm::cuda_stream_view stream)
-    : h_data{make_empty_host_vector<T>(0, stream)}, d_data(max_size, stream, cudf::get_current_device_resource_ref())
+    : h_data{make_pinned_vector_async<T>(0, stream)}, d_data(max_size, stream, cudf::get_current_device_resource_ref())
   {
     CUDF_EXPECTS(initial_size <= max_size, "initial_size cannot be larger than max_size");
 
@@ -138,7 +144,15 @@ class hostdevice_vector {
     cuda_memcpy_async<T>(h_data, d_data, stream);
   }
 
-  void device_to_host(rmm::cuda_stream_view stream) { cuda_memcpy<T>(h_data, d_data, stream); }
+  void device_to_host(rmm::cuda_stream_view stream) { 
+    pinned_debug = true;
+    expected_dst = h_data.data();
+    expected_src = d_data.data();
+    expected_size = h_data.size() * sizeof(T);
+    CUDF_EXPECTS(expected_size == d_data.size() * sizeof(T), "Mismatch in buffer sizes!");
+    cuda_memcpy<T>(h_data, d_data, stream);
+    pinned_debug = false;
+  }
 
   /**
    * @brief Converts a hostdevice_vector into a hostdevice_span.
