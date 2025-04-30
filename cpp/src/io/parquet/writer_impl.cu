@@ -1156,38 +1156,80 @@ void init_row_group_fragments(cudf::detail::hostdevice_2dvector<PageFragment>& f
   frag.device_to_host(stream);
   cudf::detail::pinned_debug = false;
 
-  std::vector<PageFragment> h_frag(num_elements);
-  cudaMemcpyAsync(h_frag.data(), frag.base_device_ptr(), data_size, cudaMemcpyDeviceToHost, stream);
-  stream.synchronize();
-  auto* d_frag = frag.base_host_ptr();
-  auto const pt = pthread_self();
-  for(size_t idx=0; idx<h_frag.size(); idx++){  
-    auto const& a = d_frag[idx];
-    auto const& b = h_frag[idx];
-    if(a.fragment_data_size != b.fragment_data_size){
-      fprintf(stderr, "Host mismatch (%lu) (fragment_data_size): %u %u\n", (uint64_t)pt, a.fragment_data_size, b.fragment_data_size);
+  {
+    std::vector<PageFragment> h_frag(num_elements);
+    cudaMemcpyAsync(h_frag.data(), frag.base_device_ptr(), data_size, cudaMemcpyDeviceToHost, stream);
+    stream.synchronize();
+    auto* p_frag = frag.base_host_ptr();
+    auto const pt = pthread_self();
+    for(size_t idx=0; idx<h_frag.size(); idx++){  
+      auto const& a = p_frag[idx];
+      auto const& b = h_frag[idx];
+      if(a.fragment_data_size != b.fragment_data_size){
+        fprintf(stderr, "Host mismatch (%lu) (fragment_data_size): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.fragment_data_size, b.fragment_data_size, (uint64_t)p_frag, (uint64_t)h_frag.data());
+      }
+      if(a.dict_data_size != b.dict_data_size){
+        fprintf(stderr, "Host mismatch (%lu) (dict_data_size): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.dict_data_size, b.dict_data_size, (uint64_t)p_frag, (uint64_t)h_frag.data());
+      }
+      if(a.num_values != b.num_values){
+        fprintf(stderr, "Host mismatch (%lu) (num_values): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.num_values, b.num_values, (uint64_t)p_frag, (uint64_t)h_frag.data());
+      }
+      if(a.start_value_idx != b.start_value_idx){
+        fprintf(stderr, "Host mismatch (%lu) (start_value_idx): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.start_value_idx, b.start_value_idx, (uint64_t)p_frag, (uint64_t)h_frag.data());
+      }
+      if(a.num_leaf_values != b.num_leaf_values){
+        fprintf(stderr, "Host mismatch (%lu) (num_leaf_values): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.num_leaf_values, b.num_leaf_values, (uint64_t)p_frag, (uint64_t)h_frag.data());
+      }
+      if(a.start_row != b.start_row){
+        fprintf(stderr, "Host mismatch (%lu) (start_row): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.start_row, b.start_row, (uint64_t)p_frag, (uint64_t)h_frag.data());
+      }
+      if(a.num_rows != b.num_rows){
+        fprintf(stderr, "Host mismatch (%lu) (num_rows): %d %d (pinned: %lu) (page : %lu)\n", (uint64_t)pt, (int)a.num_rows, (int)b.num_rows, (uint64_t)p_frag, (uint64_t)h_frag.data());
+      }
+      if(a.num_dict_vals != b.num_dict_vals){
+        fprintf(stderr, "Host mismatch (%lu) (num_dict_vals): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, (int)a.num_dict_vals, (int)b.num_dict_vals, (uint64_t)p_frag, (uint64_t)h_frag.data());
+      }
     }
-    if(a.dict_data_size != b.dict_data_size){
-      fprintf(stderr, "Host mismatch (%lu) (dict_data_size): %u %u\n", (uint64_t)pt, a.dict_data_size, b.dict_data_size);
+
+    std::vector<PageFragment> p_frag2(num_elements);
+    stream.synchronize();
+    cudaHostRegister(p_frag2.data(), data_size, cudaHostRegisterDefault);
+    stream.synchronize();
+    cudaMemcpyAsync(p_frag2.data(), frag.base_device_ptr(), data_size, cudaMemcpyDeviceToHost, stream);
+    stream.synchronize();
+
+    for(size_t idx=0; idx<p_frag2.size(); idx++){  
+      auto const& a = p_frag2[idx];
+      auto const& b = h_frag[idx];
+      if(a.fragment_data_size != b.fragment_data_size){
+        fprintf(stderr, "Host 2 mismatch (%lu) (fragment_data_size): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.fragment_data_size, b.fragment_data_size, (uint64_t)p_frag2.data(), (uint64_t)h_frag.data());
+      }
+      if(a.dict_data_size != b.dict_data_size){
+        fprintf(stderr, "Host 2 mismatch (%lu) (dict_data_size): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.dict_data_size, b.dict_data_size, (uint64_t)p_frag2.data(), (uint64_t)h_frag.data());
+      }
+      if(a.num_values != b.num_values){
+        fprintf(stderr, "Host 2 mismatch (%lu) (num_values): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.num_values, b.num_values, (uint64_t)p_frag2.data(), (uint64_t)h_frag.data());
+      }
+      if(a.start_value_idx != b.start_value_idx){
+        fprintf(stderr, "Host 2 mismatch (%lu) (start_value_idx): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.start_value_idx, b.start_value_idx, (uint64_t)p_frag2.data(), (uint64_t)h_frag.data());
+      }
+      if(a.num_leaf_values != b.num_leaf_values){
+        fprintf(stderr, "Host 2 mismatch (%lu) (num_leaf_values): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.num_leaf_values, b.num_leaf_values, (uint64_t)p_frag2.data(), (uint64_t)h_frag.data());
+      }
+      if(a.start_row != b.start_row){
+        fprintf(stderr, "Host 2 mismatch (%lu) (start_row): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, a.start_row, b.start_row, (uint64_t)p_frag2.data(), (uint64_t)h_frag.data());
+      }
+      if(a.num_rows != b.num_rows){
+        fprintf(stderr, "Host 2 mismatch (%lu) (num_rows): %d %d (pinned: %lu) (page : %lu)\n", (uint64_t)pt, (int)a.num_rows, (int)b.num_rows, (uint64_t)p_frag2.data(), (uint64_t)h_frag.data());
+      }
+      if(a.num_dict_vals != b.num_dict_vals){
+        fprintf(stderr, "Host 2 mismatch (%lu) (num_dict_vals): %u %u (pinned: %lu) (page : %lu)\n", (uint64_t)pt, (int)a.num_dict_vals, (int)b.num_dict_vals, (uint64_t)p_frag2.data(), (uint64_t)h_frag.data());
+      }
     }
-    if(a.num_values != b.num_values){
-      fprintf(stderr, "Host mismatch (%lu) (num_values): %u %u\n", (uint64_t)pt, a.num_values, b.num_values);
-    }
-    if(a.start_value_idx != b.start_value_idx){
-      fprintf(stderr, "Host mismatch (%lu) (start_value_idx): %u %u\n", (uint64_t)pt, a.start_value_idx, b.start_value_idx);
-    }
-    if(a.num_leaf_values != b.num_leaf_values){
-      fprintf(stderr, "Host mismatch (%lu) (num_leaf_values): %u %u\n", (uint64_t)pt, a.num_leaf_values, b.num_leaf_values);
-    }
-    if(a.start_row != b.start_row){
-      fprintf(stderr, "Host mismatch (%lu) (start_row): %u %u\n", (uint64_t)pt, a.start_row, b.start_row);
-    }
-    if(a.num_rows != b.num_rows){
-      fprintf(stderr, "Host mismatch (%lu) (num_rows): %d %d\n", (uint64_t)pt, (int)a.num_rows, (int)b.num_rows);
-    }
-    if(a.num_dict_vals != b.num_dict_vals){
-      fprintf(stderr, "Host mismatch (%lu) (num_dict_vals): %u %u\n", (uint64_t)pt, (int)a.num_dict_vals, (int)b.num_dict_vals);
-    }
+
+    stream.synchronize();
+    cudaHostUnregister(p_frag2.data());
+    stream.synchronize();
   }
 }
 
